@@ -12,7 +12,6 @@ import shutil
 # استيرادات Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-# يجب استيراد Service الآن
 from selenium.webdriver.chrome.service import Service 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -35,11 +34,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# --- دالة تهيئة متصفح Selenium (الإصلاح الجذري للخطأ) ---
+# --- دالة تهيئة متصفح Selenium (مُثبتة لـ Heroku) ---
 def init_driver():
     """
     تهيئة متصفح Chrome في وضع Headless.
-    يستخدم كائن Service لتمرير مسار السائق (ChromeDriver) بدلاً من executable_path.
+    يستخدم متغيرات البيئة CHROME_BIN و CHROMEDRIVER_PATH التي يوفرها Buildpack.
     """
     
     # قراءة متغيرات البيئة التي يوفرها Buildpack
@@ -64,7 +63,7 @@ def init_driver():
     chrome_options.binary_location = chrome_bin 
 
     try:
-        # **الإصلاح هنا:** إنشاء كائن Service لتمرير مسار Driver
+        # الإصدار الصحيح لـ Selenium 4.x: استخدام Service object وتمرير مسار Driver
         service = Service(executable_path=chromedriver_path)
         
         # تمرير كائن Service بدلاً من executable_path مباشرةً
