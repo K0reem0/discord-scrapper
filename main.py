@@ -1,7 +1,5 @@
 import discord
 from discord.ext import commands
-import requests
-from bs4 import BeautifulSoup
 from PIL import Image
 from io import BytesIO
 import dropbox
@@ -11,15 +9,26 @@ import asyncio
 import uuid
 import zipfile
 import shutil
-import glob
+# استيرادات Selenium
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+# استيراد webdriver-manager
+from webdriver_manager.chrome import ChromeDriverManager
+import requests
 
-# --- الإعدادات والثوابت (كما هي) ---
+# --- الإعدادات والثوابت ---
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
-MIN_WIDTH = 800      # الحد الأدنى لعرض الصورة بالبكسل
-CLEANUP_DELAY_SECONDS = 900 # 15 دقيقة = 900 ثانية
+
+MIN_WIDTH = 800
+CLEANUP_DELAY_SECONDS = 900
 LOCAL_TEMP_DIR = "manga_temp" 
-IMAGE_DOWNLOAD_TIMEOUT = 15 # مهلة 15 ثانية لتحميل كل صورة
+IMAGE_DOWNLOAD_TIMEOUT = 15 
 
 # إعداد البوت
 intents = discord.Intents.default()
@@ -27,30 +36,83 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# دالة مساعدة لتنزيل صورة والتحقق من حجمها (مضافة مهلة انتظار)
+# --- دالة تهيئة متصفح Selenium ---
+def init_driver():
+    """تهيئة متصفح Chrome في وضع Headless."""
+    
+    # قراءة متغيرات البيئة لـ Heroku (لتحديد مسار المتصفح فقط)
+    chrome_bin = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
+    
+    chrome_options = Options()
+    
+    # خيارات أساسية لـ Headless
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    
+    # تعيين مسار Chrome إذا كان متاحاً (ضروري لـ Heroku)
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin 
+
+    try:
+        # استخدام webdriver-manager لتحديد مسار السائق
+        # ملاحظة: إذا فشلت هذه الطريقة على Heroku، يجب العودة لتعيين executable_path يدويًا كما في الكود السابق.
+        service = Service(ChromeDriverManager().install())
+        
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver using webdriver-manager: {e}")
+        # محاولة أخيرة باستخدام المسارات الثابتة لـ Heroku (للتوافق القديم)
+        try:
+             chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+             if chromedriver_path and chrome_bin:
+                driver = webdriver.Chrome(executable_path=chromedriver_path, options=chrome_options)
+                print("[INFO] Successfully initialized using Heroku static paths after webdriver-manager failure.")
+                return driver
+        except Exception as e_fallback:
+             print(f"[CRITICAL ERROR] Fallback initialization also failed: {e_fallback}")
+             return None
+
+
+# --- الدوال المساعدة ---
+
 def download_and_check_image(image_url):
+    """
+    تحميل الصورة مع مهلة، التحقق من حجمها، وتحويلها لـ RGB إذا لم تكن PNG.
+    """
     try:
         response = requests.get(image_url, stream=True, timeout=IMAGE_DOWNLOAD_TIMEOUT)
-        response.raise_for_status()
+        response.raise_for_status() 
         
         image_bytes = BytesIO(response.content)
         img = Image.open(image_bytes)
         
-        # إذا كانت الصورة ليست PNG، نحولها لـ RGB لضمان التوافق مع JPEG
         if img.format != 'PNG':
             img = img.convert("RGB")
         
         if img.width >= MIN_WIDTH:
-            image_bytes.seek(0)
-            return img, img.format.lower() if img.format else 'jpg'
+            format_ext = img.format.lower() if img.format == 'PNG' else 'jpg'
+            return img, format_ext
         else:
+            print(f"[ERROR LOG] Skipping image {image_url}: Width {img.width}px is less than {MIN_WIDTH}px.")
             return None, None
+            
     except requests.exceptions.Timeout:
-        print(f"Error processing image {image_url}: Request timed out after {IMAGE_DOWNLOAD_TIMEOUT}s")
+        print(f"[ERROR LOG] Request Timeout for image: {image_url} after {IMAGE_DOWNLOAD_TIMEOUT}s.")
+        return None, None
+    except requests.exceptions.HTTPError as http_err:
+        print(f"[ERROR LOG] HTTP Error for image: {http_err} for URL {image_url}.")
+        return None, None
+    except requests.exceptions.RequestException as req_err:
+        print(f"[ERROR LOG] Request Error for image: {req_err} for URL {image_url}.")
         return None, None
     except Exception as e:
-        print(f"Error processing image {image_url}: {e}")
+        print(f"[ERROR LOG] Generic Error processing image {image_url}: {e}")
         return None, None
+
 
 async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
     """ينتظر 15 دقيقة ثم يحذف الملف المضغوط من Dropbox."""
@@ -60,6 +122,59 @@ async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
         print(f"🗑️ تم حذف ملف ZIP ({dropbox_path}) بنجاح بعد {delay_seconds} ثواني.")
     except Exception as e:
         print(f"❌ فشل حذف ملف ZIP ({dropbox_path}): {e}")
+        print(f"[ERROR LOG] Cleanup failed for {dropbox_path}: {e}")
+
+
+def merge_chapter_images(chapter_folder: str):
+    """
+    تنفذ دمج الصور لملفات JPG/JPEG فقط لضمان عدد زوجي من المخرجات، وتتجاهل PNG.
+    """
+    jpeg_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg'))])
+    
+    num_jpeg = len(jpeg_files)
+    merge_list = [] 
+    
+    i = 0
+    while i + 1 < num_jpeg:
+        file1_name = jpeg_files[i]
+        file2_name = jpeg_files[i+1]
+        merge_list.append((os.path.join(chapter_folder, file1_name), os.path.join(chapter_folder, file2_name)))
+        i += 2
+        
+    for file1_path, file2_path in merge_list:
+        try:
+            img1 = Image.open(file1_path).convert("RGB")
+            img2 = Image.open(file2_path).convert("RGB")
+            
+            max_width = max(img1.width, img2.width)
+            total_height = img1.height + img2.height
+            
+            merged_img = Image.new('RGB', (max_width, total_height))
+            merged_img.paste(img1, (0, 0))
+            merged_img.paste(img2, (0, img1.height))
+            
+            merged_img.save(file1_path, 'jpeg', quality=90) 
+            os.remove(file2_path)
+            print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
+
+        except Exception as e:
+            print(f"[ERROR LOG] Failed to merge images {os.path.basename(file1_path)} and {os.path.basename(file2_path)}: {e}")
+            continue
+
+    final_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
+    
+    for index, filename in enumerate(final_files):
+        ext = filename.split('.')[-1]
+        new_filename = f"{index + 1:03d}.{ext}"
+        
+        if filename != new_filename:
+            try:
+                os.rename(os.path.join(chapter_folder, filename), os.path.join(chapter_folder, new_filename))
+            except Exception as e:
+                print(f"[ERROR LOG] Failed to rename file {filename} to {new_filename}: {e}")
+
+
+# --- أحداث البوت ---
 
 @bot.event
 async def on_ready():
@@ -71,71 +186,11 @@ async def on_ready():
         print("Dropbox connection successful.")
     except Exception as e:
         print(f"Dropbox connection failed or slash commands sync failed: {e}")
-
-# دالة لدمج الصور داخل مجلد الفصل محلياً (المعدلة)
-def merge_chapter_images(chapter_folder: str):
-    """
-    تنفذ دمج الصور لملفات JPG/JPEG فقط.
-    تتجاهل ملفات PNG.
-    """
-    
-    # 1. فلترة وتحديد ملفات JPG/JPEG فقط للدمج
-    jpeg_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg'))])
-    
-    num_jpeg = len(jpeg_files)
-    
-    # قائمة بأسماء الملفات المراد دمجها (أزواج)
-    merge_list = [] 
-    
-    # تحديد أزواج الصور (كل اثنين مع بعض)
-    i = 0
-    while i + 1 < num_jpeg:
-        file1_name = jpeg_files[i]
-        file2_name = jpeg_files[i+1]
-        merge_list.append((os.path.join(chapter_folder, file1_name), os.path.join(chapter_folder, file2_name)))
-        i += 2
-        
-    # 2. تنفيذ الدمج على أزواج JPG/JPEG
-    for file1_path, file2_path in merge_list:
-        try:
-            # نستخدم RGB للصور المدمجة لضمان التوافق مع JPEG
-            img1 = Image.open(file1_path).convert("RGB")
-            img2 = Image.open(file2_path).convert("RGB")
-            
-            max_width = max(img1.width, img2.width)
-            total_height = img1.height + img2.height
-            
-            merged_img = Image.new('RGB', (max_width, total_height))
-            merged_img.paste(img1, (0, 0))
-            merged_img.paste(img2, (0, img1.height))
-            
-            # حفظ الصورة المدمجة بالاسم الأقدم (كـ JPEG)
-            merged_img.save(file1_path, 'jpeg', quality=90) 
-            
-            # حذف الصورة الثانية
-            os.remove(file2_path)
-            print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
-
-        except Exception as e:
-            print(f"Failed to merge images {os.path.basename(file1_path)} and {os.path.basename(file2_path)}: {e}")
-            continue
-
-    # 3. إعادة ترقيم جميع الملفات المتبقية (PNG + JPEG المدمجة/المفردة)
-    
-    # الحصول على جميع الملفات المتبقية
-    final_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
-    
-    for index, filename in enumerate(final_files):
-        # تحديد الصيغة الأصلية
-        ext = filename.split('.')[-1]
-        # الترقيم الجديد (001.jpg, 002.png, 003.jpg, ...)
-        new_filename = f"{index + 1:03d}.{ext}"
-        
-        if filename != new_filename:
-            os.rename(os.path.join(chapter_folder, filename), os.path.join(chapter_folder, new_filename))
+        print(f"[ERROR LOG] Initial setup failed: {e}")
 
 
-# أمر التطبيق (Slash Command)
+# --- أمر التطبيق (Slash Command) ---
+
 @bot.tree.command(name="download", description="تحميل الصور من مواقع المانجا وضغطها ورفعها.")
 @discord.app_commands.describe(
     url="رابط صفحة المانجا",
@@ -150,7 +205,6 @@ async def download_command(
 ):
     user_mention = interaction.user.mention
     
-    # الرسالة الابتدائية المظللة
     initial_embed = discord.Embed(
         title="📥 تحميل فصل المانهوا",
         description=f"{user_mention} **جارِ المعالجة، الرجاء الانتظار...** ⌛",
@@ -160,53 +214,74 @@ async def download_command(
     await interaction.response.send_message(embed=initial_embed, ephemeral=False)
     original_response = await interaction.original_response()
 
+    # --- تهيئة المتصفح ---
+    driver = init_driver()
+    if not driver:
+        if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
+        await original_response.edit(embed=discord.Embed(title="❌ فشل التهيئة", description="**فشل في تهيئة متصفح Chrome/Selenium. الرجاء التحقق من إعدادات Buildpacks والتوزيع.**", color=discord.Color.red()))
+        return
+
+    # إنشاء مجلد العمل المؤقت
     if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
     
     base_url_pattern = re.sub(r'chapter-\d+', 'chapter-{}', url)
     if '{}' not in base_url_pattern:
         shutil.rmtree(LOCAL_TEMP_DIR)
+        driver.quit()
+        print(f"[ERROR LOG] URL parsing failed: Base URL did not contain 'chapter-XX'. URL: {url}")
         await original_response.edit(content="❌ **فشل في تحليل الرابط!** تأكد من أن رقم الفصل مكتوب كـ `chapter-XX` في الرابط.")
         return
 
     chapters_processed = 0
     
+    # --- حلقة معالجة الفصول ---
     for current_chapter_num in range(chapter_number, chapter_number + chapters):
         current_url = base_url_pattern.format(current_chapter_num)
         local_chapter_folder = os.path.join(LOCAL_TEMP_DIR, str(current_chapter_num))
         images_downloaded = 0
         
         try:
-            initial_embed.description = f"{user_mention} **جارِ تنزيل الفصل {current_chapter_num}، الرجاء الانتظار...** ⏳"
+            initial_embed.description = f"{user_mention} **جارِ جلب وتحميل الفصل {current_chapter_num}، الرجاء الانتظار...** ⏳"
             await original_response.edit(embed=initial_embed)
             
             os.makedirs(local_chapter_folder, exist_ok=True)
-            response = requests.get(current_url)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
             
-            image_tags = soup.find_all('img', class_='page-image') 
-            if not image_tags: image_tags = soup.find_all('img')
-            if not image_tags: 
+            # 1. جلب الصفحة باستخدام Selenium والانتظار حتى تحميل الصور
+            driver.get(current_url)
+            
+            # الانتظار حتى تحميل أول صورة
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"]'))
+            )
+            
+            # تمرير الصفحة للأسفل لضمان تحميل جميع الصور (Lazy Loading)
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            
+            # إعطاء مهلة إضافية بسيطة للانتهاء من التحميل بعد التمرير
+            await asyncio.sleep(3) 
+            
+            # 2. استخراج روابط الصور
+            image_elements = driver.find_elements(By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"]')
+            image_srcs = [img.get_attribute('src') for img in image_elements if img.get_attribute('src')]
+            
+            if not image_srcs: 
+                print(f"[ERROR LOG] No images found via Selenium in chapter {current_chapter_num} at URL: {current_url}")
                 shutil.rmtree(local_chapter_folder)
                 continue
             
+            # 3. تنزيل وحفظ الصور (باستخدام requests لفعالية التنزيل)
             image_counter = 1
-            for img_tag in image_tags:
-                img_src = img_tag.get('src')
+            for img_src in image_srcs:
                 if not img_src or img_src.startswith('data:'): continue
-                if img_src.startswith('//'): img_src = 'https:' + img_src
-                elif img_src.startswith('/'): img_src = current_url.split('/reader')[0] + img_src 
 
                 img_obj, file_format = download_and_check_image(img_src)
                 
                 if img_obj:
-                    # نحدد الصيغة بناءً على ما تم اكتشافه (png يبقى png، والباقي يكون jpeg)
-                    ext = file_format if file_format == 'png' else 'jpg'
+                    ext = file_format 
                     filename = f"{image_counter:03d}.{ext}"
                     local_file_path = os.path.join(local_chapter_folder, filename)
                     
-                    # حفظ كائن الصورة (PNG تحفظ كـ PNG، و JPEG تحفظ كـ JPEG)
                     if ext == 'png':
                         img_obj.save(local_file_path, 'png')
                     else:
@@ -215,26 +290,39 @@ async def download_command(
                     images_downloaded += 1
                     image_counter += 1
             
-            # --- دمج الصور بعد التنزيل ---
+            # دمج الصور بعد التنزيل
             if images_downloaded > 0:
                 initial_embed.description = f"{user_mention} **جارِ دمج وضغط الفصل {current_chapter_num}...** ⚙️"
                 await original_response.edit(embed=initial_embed)
-                merge_chapter_images(local_chapter_folder) # تنفيذ دمج الصور
+                merge_chapter_images(local_chapter_folder) 
                 chapters_processed += 1
             else:
+                print(f"[ERROR LOG] No images were successfully downloaded in chapter {current_chapter_num}.")
                 shutil.rmtree(local_chapter_folder)
             
+        except TimeoutException:
+            print(f"[ERROR LOG] Selenium Timeout: Page took too long to load images for chapter {current_chapter_num} (URL: {current_url}).")
+            if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
+            continue
+        except WebDriverException as wde:
+            print(f"[ERROR LOG] WebDriver Error (Chapter {current_chapter_num}): {wde}")
+            if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
+            continue
         except Exception as e:
-            print(f"Error in chapter {current_chapter_num}: {e}")
+            print(f"[ERROR LOG] Unexpected Error in chapter {current_chapter_num}: {e}")
             if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
             continue
     
+    # إغلاق المتصفح بعد الانتهاء من جميع الفصول
+    driver.quit() 
+
+    # --- إنهاء العملية (الضغط والرفع) ---
     if chapters_processed == 0:
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
         await original_response.edit(embed=discord.Embed(title="❌ فشل", description="**لم يتم معالجة أو تنزيل أي فصول بنجاح.**", color=discord.Color.red()))
         return
 
-    # --- مرحلة الضغط والرفع ---
+    # 1. الضغط
     unique_id = uuid.uuid4().hex[:8]
     zip_filename = f"manga_{unique_id}.zip"
     local_zip_path = os.path.join(os.getcwd(), zip_filename)
@@ -250,22 +338,25 @@ async def download_command(
                     arcname = os.path.relpath(file_path, LOCAL_TEMP_DIR)
                     zipf.write(file_path, arcname)
     except Exception as e:
+        print(f"[ERROR LOG] ZIP compression failed: {e}")
         await original_response.edit(content=f"```ini\n[ ❌ خطأ ]\n```\n**فشل في عملية ضغط الملفات: {e}**")
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
         if os.path.exists(local_zip_path): os.remove(local_zip_path)
         return
     
+    # 2. الرفع
     dropbox_path = f"/{zip_filename}"
     try:
         with open(local_zip_path, 'rb') as f:
             dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode('overwrite'))
     except Exception as e:
+        print(f"[ERROR LOG] Dropbox upload failed: {e}")
         await original_response.edit(content=f"```ini\n[ ❌ خطأ ]\n```\n**فشل في عملية الرفع إلى Dropbox: {e}**")
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
         if os.path.exists(local_zip_path): os.remove(local_zip_path)
         return
 
-    # --- إنشاء رابط المشاركة والتنظيف النهائي ---
+    # 3. الرابط والتنظيف
     shared_link = ""
     try:
         shared_link_metadata = dbx.sharing_create_shared_link_with_settings(dropbox_path)
@@ -276,6 +367,7 @@ async def download_command(
             if shared_links:
                 shared_link = shared_links[0].url
         else:
+            print(f"[ERROR LOG] Failed to create shared link: {e}")
             shared_link = "(فشل إنشاء رابط مشاركة)"
 
     if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
@@ -283,7 +375,7 @@ async def download_command(
         
     bot.loop.create_task(cleanup_dropbox_file(dropbox_path, CLEANUP_DELAY_SECONDS))
 
-    # --- رسالة الملخص النهائية (تنسيق التضمين) ---
+    # 4. رسالة النجاح النهائية
     final_embed = discord.Embed(
         title="✅ تم الرفع إلى Dropbox",
         description=f"{user_mention} **تم رفع الملف بنجاح! يمكنك تحميله من الرابط التالي:**\n\n"
