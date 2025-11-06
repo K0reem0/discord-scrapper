@@ -12,13 +12,12 @@ import shutil
 # استيرادات Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+# تم حذف: from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-# استيراد webdriver-manager
-from webdriver_manager.chrome import ChromeDriverManager
+# تم حذف: from webdriver_manager.chrome import ChromeDriverManager
 import requests
 
 # --- الإعدادات والثوابت ---
@@ -36,13 +35,24 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# --- دالة تهيئة متصفح Selenium ---
+# --- دالة تهيئة متصفح Selenium (إصلاح خطأ Driver) ---
 def init_driver():
-    """تهيئة متصفح Chrome في وضع Headless."""
+    """
+    تهيئة متصفح Chrome في وضع Headless.
+    يعتمد على المسارات الثابتة التي يوفرها Buildpack لتجنب تعارض إصدارات Driver.
+    """
     
-    # قراءة متغيرات البيئة لـ Heroku (لتحديد مسار المتصفح فقط)
+    # قراءة متغيرات البيئة التي يوفرها Buildpack
+    # CHROME_BIN: مسار المتصفح (Chrome)
+    # CHROMEDRIVER_PATH: مسار السائق (ChromeDriver)
     chrome_bin = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
     
+    if not chrome_bin or not chromedriver_path:
+        print("[CRITICAL ERROR] Heroku environment variables (CHROME_BIN/CHROMEDRIVER_PATH) not found.")
+        print("[CRITICAL ERROR] Please ensure the Buildpack is correctly installed and deployed.")
+        return None
+
     chrome_options = Options()
     
     # خيارات أساسية لـ Headless
@@ -52,29 +62,17 @@ def init_driver():
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-dev-shm-usage")
     
-    # تعيين مسار Chrome إذا كان متاحاً (ضروري لـ Heroku)
-    if chrome_bin:
-        chrome_options.binary_location = chrome_bin 
+    # تعيين مسار Chrome (إصدار 142.0.7444.61)
+    chrome_options.binary_location = chrome_bin 
 
     try:
-        # استخدام webdriver-manager لتحديد مسار السائق
-        # ملاحظة: إذا فشلت هذه الطريقة على Heroku، يجب العودة لتعيين executable_path يدويًا كما في الكود السابق.
-        service = Service(ChromeDriverManager().install())
-        
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        # استخدام المسار الثابت الذي يضمن توافق Chrome Driver مع نسخة Chrome المثبتة
+        driver = webdriver.Chrome(executable_path=chromedriver_path, options=chrome_options)
+        print("[INFO] Chrome Driver initialized successfully using Heroku static paths.")
         return driver
-    except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver using webdriver-manager: {e}")
-        # محاولة أخيرة باستخدام المسارات الثابتة لـ Heroku (للتوافق القديم)
-        try:
-             chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
-             if chromedriver_path and chrome_bin:
-                driver = webdriver.Chrome(executable_path=chromedriver_path, options=chrome_options)
-                print("[INFO] Successfully initialized using Heroku static paths after webdriver-manager failure.")
-                return driver
-        except Exception as e_fallback:
-             print(f"[CRITICAL ERROR] Fallback initialization also failed: {e_fallback}")
-             return None
+    except WebDriverException as e:
+        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
+        return None
 
 
 # --- الدوال المساعدة ---
