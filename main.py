@@ -12,12 +12,12 @@ import shutil
 # استيرادات Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-# تم حذف: from selenium.webdriver.chrome.service import Service
+# يجب استيراد Service الآن
+from selenium.webdriver.chrome.service import Service 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-# تم حذف: from webdriver_manager.chrome import ChromeDriverManager
 import requests
 
 # --- الإعدادات والثوابت ---
@@ -35,16 +35,14 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# --- دالة تهيئة متصفح Selenium (إصلاح خطأ Driver) ---
+# --- دالة تهيئة متصفح Selenium (الإصلاح الجذري للخطأ) ---
 def init_driver():
     """
     تهيئة متصفح Chrome في وضع Headless.
-    يعتمد على المسارات الثابتة التي يوفرها Buildpack لتجنب تعارض إصدارات Driver.
+    يستخدم كائن Service لتمرير مسار السائق (ChromeDriver) بدلاً من executable_path.
     """
     
     # قراءة متغيرات البيئة التي يوفرها Buildpack
-    # CHROME_BIN: مسار المتصفح (Chrome)
-    # CHROMEDRIVER_PATH: مسار السائق (ChromeDriver)
     chrome_bin = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
     
@@ -62,13 +60,16 @@ def init_driver():
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-dev-shm-usage")
     
-    # تعيين مسار Chrome (إصدار 142.0.7444.61)
+    # تعيين مسار Chrome
     chrome_options.binary_location = chrome_bin 
 
     try:
-        # استخدام المسار الثابت الذي يضمن توافق Chrome Driver مع نسخة Chrome المثبتة
-        driver = webdriver.Chrome(executable_path=chromedriver_path, options=chrome_options)
-        print("[INFO] Chrome Driver initialized successfully using Heroku static paths.")
+        # **الإصلاح هنا:** إنشاء كائن Service لتمرير مسار Driver
+        service = Service(executable_path=chromedriver_path)
+        
+        # تمرير كائن Service بدلاً من executable_path مباشرةً
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("[INFO] Chrome Driver initialized successfully using Heroku static paths and Service object.")
         return driver
     except WebDriverException as e:
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
