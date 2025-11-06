@@ -12,12 +12,11 @@ import shutil
 # استيرادات Selenium
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.service import Service 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
 import requests
 
 # --- الإعدادات والثوابت ---
@@ -25,9 +24,10 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 
 MIN_WIDTH = 800
-CLEANUP_DELAY_SECONDS = 3000
+CLEANUP_DELAY_SECONDS = 1800
 LOCAL_TEMP_DIR = "manga_temp" 
-IMAGE_DOWNLOAD_TIMEOUT = 50 
+IMAGE_DOWNLOAD_TIMEOUT = 30 
+VALID_FORMATS = ['jpg', 'jpeg', 'webp', 'png']
 
 # إعداد البوت
 intents = discord.Intents.default()
@@ -35,45 +35,70 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# --- دالة تهيئة متصفح Selenium ---
+# --- دالة تهيئة متصفح Selenium (مُثبتة لـ Heroku) ---
 def init_driver():
-    """تهيئة متصفح Chrome في وضع Headless."""
+    """
+    تهيئة متصفح Chrome في وضع Headless.
+    يستخدم متغيرات البيئة CHROME_BIN و CHROMEDRIVER_PATH التي يوفرها Buildpack.
+    """
     
+    # قراءة متغيرات البيئة التي يوفرها Buildpack
     chrome_bin = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
     
+    if not chrome_bin or not chromedriver_path:
+        print("[CRITICAL ERROR] Heroku environment variables (CHROME_BIN/CHROMEDRIVER_PATH) not found.")
+        print("[CRITICAL ERROR] Please ensure the Buildpack is correctly installed and deployed.")
+        return None
+
     chrome_options = Options()
+    
+    # خيارات أساسية لـ Headless
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-dev-shm-usage")
     
-    if chrome_bin:
-        chrome_options.binary_location = chrome_bin 
+    # تعيين مسار Chrome
+    chrome_options.binary_location = chrome_bin 
 
     try:
-        service = Service(ChromeDriverManager().install())
+        # الإصدار الصحيح لـ Selenium 4.x: استخدام Service object وتمرير مسار Driver
+        service = Service(executable_path=chromedriver_path)
+        
+        # تمرير كائن Service بدلاً من executable_path مباشرةً
         driver = webdriver.Chrome(service=service, options=chrome_options)
+        print("[INFO] Chrome Driver initialized successfully using Heroku static paths and Service object.")
         return driver
-    except Exception as e:
-        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver using webdriver-manager: {e}")
-        try:
-             chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
-             if chromedriver_path and chrome_bin:
-                driver = webdriver.Chrome(executable_path=chromedriver_path, options=chrome_options)
-                print("[INFO] Successfully initialized using Heroku static paths after webdriver-manager failure.")
-                return driver
-        except Exception as e_fallback:
-             print(f"[CRITICAL ERROR] Fallback initialization also failed: {e_fallback}")
-             return None
+    except WebDriverException as e:
+        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
+        return None
 
 
 # --- الدوال المساعدة ---
 
-def download_and_check_image(image_url):
+def download_and_check_image(image_url, target_format="jpg"):
     """
-    تحميل الصورة مع مهلة، التحقق من حجمها، وتحويلها لـ RGB إذا لم تكن PNG.
+    تحميل الصورة مع مهلة، التحقق من حجمها، وتحويلها لـ RGB والـ format المستهدف.
     """
+    target_format = target_format.lower()
+    
+    # تعيين صيغة الحفظ الفعلية
+    if target_format in ['jpg', 'jpeg']:
+        save_format = 'jpeg'
+        ext = 'jpg'
+    elif target_format == 'webp':
+        save_format = 'webp'
+        ext = 'webp'
+    elif target_format == 'png':
+        save_format = 'png'
+        ext = 'png'
+    else:
+        # الصيغة الافتراضية إذا كانت غير صالحة
+        save_format = 'jpeg'
+        ext = 'jpg'
+
     try:
         response = requests.get(image_url, stream=True, timeout=IMAGE_DOWNLOAD_TIMEOUT)
         response.raise_for_status() 
@@ -81,29 +106,30 @@ def download_and_check_image(image_url):
         image_bytes = BytesIO(response.content)
         img = Image.open(image_bytes)
         
-        # دائماً نحولها لـ RGB (ما لم تكن PNG) لضمان التوافق مع JPG/WEBP
-        if img.format != 'PNG':
+        # تحويل لـ RGB ما لم تكن الصيغة المستهدفة PNG
+        if save_format != 'png':
+             # التحويل إلى RGB يزيل قناة ألفا (الشفافية) الضرورية للـ PNG
             img = img.convert("RGB")
         
         if img.width >= MIN_WIDTH:
-            # نرجع كائن الصورة فقط، ودالة الحفظ هي التي تقرر الصيغة النهائية
-            return img 
+            return img, ext, save_format
         else:
             print(f"[ERROR LOG] Skipping image {image_url}: Width {img.width}px is less than {MIN_WIDTH}px.")
-            return None
+            return None, None, None
             
     except requests.exceptions.Timeout:
         print(f"[ERROR LOG] Request Timeout for image: {image_url} after {IMAGE_DOWNLOAD_TIMEOUT}s.")
-        return None
+        return None, None, None
     except requests.exceptions.HTTPError as http_err:
         print(f"[ERROR LOG] HTTP Error for image: {http_err} for URL {image_url}.")
-        return None
+        return None, None, None
     except requests.exceptions.RequestException as req_err:
         print(f"[ERROR LOG] Request Error for image: {req_err} for URL {image_url}.")
-        return None
+        return None, None, None
     except Exception as e:
         print(f"[ERROR LOG] Generic Error processing image {image_url}: {e}")
-        return None
+        return None, None, None
+
 
 async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
     """ينتظر 15 دقيقة ثم يحذف الملف المضغوط من Dropbox."""
@@ -116,38 +142,47 @@ async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
         print(f"[ERROR LOG] Cleanup failed for {dropbox_path}: {e}")
 
 
-def merge_chapter_images(chapter_folder: str, output_ext: str):
+def merge_chapter_images(chapter_folder: str, image_format: str):
     """
-    تنفذ دمج الصور لملفات JPG/JPEG فقط، وتتجاهل باقي الصيغ.
-    ثم تعيد ترقيم جميع الملفات الناتجة بالصيغة المطلوبة.
+    تنفذ دمج الصور لملفات JPG/JPEG فقط لضمان عدد زوجي من المخرجات، وتتجاهل الصيغ الأخرى.
     """
-    # نبحث عن الملفات التي قد تحتاج للدمج (المحفوظة كـ jpg أو jpeg مؤقتاً)
-    mergeable_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg'))])
     
-    num_mergeable = len(mergeable_files)
+    if image_format.lower() not in ['jpg', 'jpeg']:
+        print(f"[INFO] Skipping merge: Merge is only supported for JPG/JPEG format, current format is {image_format}.")
+        return
+
+    # جمع ملفات JPG/JPEG فقط
+    jpeg_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg'))])
+    
+    num_jpeg = len(jpeg_files)
     merge_list = [] 
     
     i = 0
-    while i + 1 < num_mergeable:
-        file1_name = mergeable_files[i]
-        file2_name = mergeable_files[i+1]
+    # إنشاء قائمة بالملفات التي سيتم دمجها (اثنين باثنين)
+    while i + 1 < num_jpeg:
+        file1_name = jpeg_files[i]
+        file2_name = jpeg_files[i+1]
         merge_list.append((os.path.join(chapter_folder, file1_name), os.path.join(chapter_folder, file2_name)))
         i += 2
         
-    # 1. تنفيذ الدمج
     for file1_path, file2_path in merge_list:
         try:
-            img1 = Image.open(file1_path).convert("RGB")
+            # يجب استخدام convert("RGB") لضمان التوافق بين الصورتين
+            img1 = Image.open(file1_path).convert("RGB") 
             img2 = Image.open(file2_path).convert("RGB")
             
             max_width = max(img1.width, img2.width)
             total_height = img1.height + img2.height
             
             merged_img = Image.new('RGB', (max_width, total_height))
-            merged_img.paste(img1, (0, 0))
-            merged_img.paste(img2, (0, img1.height))
+            # لصق الصورة الأولى في الأعلى
+            merged_img.paste(img1, (0, 0)) 
+            # لصق الصورة الثانية أسفل الأولى
+            merged_img.paste(img2, (0, img1.height)) 
             
-            merged_img.save(file1_path, 'jpeg', quality=90) # الحفظ كـ JPG مؤقتاً
+            # حفظ الصورة المدمجة فوق الصورة الأولى
+            merged_img.save(file1_path, 'jpeg', quality=90) 
+            # حذف الصورة الثانية
             os.remove(file2_path)
             print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
 
@@ -155,36 +190,18 @@ def merge_chapter_images(chapter_folder: str, output_ext: str):
             print(f"[ERROR LOG] Failed to merge images {os.path.basename(file1_path)} and {os.path.basename(file2_path)}: {e}")
             continue
 
-    # 2. إعادة تسمية/تحويل جميع الملفات المتبقية إلى الصيغة النهائية المطلوبة
-    final_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))])
+    # إعادة ترقيم الملفات النهائية
+    final_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(tuple(VALID_FORMATS))])
     
     for index, filename in enumerate(final_files):
-        current_path = os.path.join(chapter_folder, filename)
-        new_filename = f"{index + 1:03d}.{output_ext}"
-        new_path = os.path.join(chapter_folder, new_filename)
+        ext = filename.split('.')[-1]
+        new_filename = f"{index + 1:03d}.{ext}"
         
-        try:
-            # إذا لم تكن الصيغة الحالية هي الصيغة المطلوبة، نقوم بتحويلها
-            if not filename.lower().endswith(output_ext):
-                img = Image.open(current_path).convert("RGB")
-                
-                # حفظ بالصيغة المطلوبة
-                if output_ext == 'webp':
-                    img.save(new_path, 'webp', quality=90)
-                elif output_ext == 'jpg':
-                    img.save(new_path, 'jpeg', quality=90)
-                else: # افتراضياً، png أو أي شيء آخر
-                    img.save(new_path, output_ext)
-                
-                # حذف الملف الأصلي بعد التحويل
-                os.remove(current_path)
-            
-            # إذا كانت الصيغة الحالية هي الصيغة المطلوبة، نقوم فقط بإعادة الترقيم
-            elif filename != new_filename:
-                 os.rename(current_path, new_path)
-            
-        except Exception as e:
-             print(f"[ERROR LOG] Failed to convert/rename file {filename} to {new_filename}: {e}")
+        if filename != new_filename:
+            try:
+                os.rename(os.path.join(chapter_folder, filename), os.path.join(chapter_folder, new_filename))
+            except Exception as e:
+                print(f"[ERROR LOG] Failed to rename file {filename} to {new_filename}: {e}")
 
 
 # --- أحداث البوت ---
@@ -193,10 +210,8 @@ def merge_chapter_images(chapter_folder: str, output_ext: str):
 async def on_ready():
     print(f'Bot is ready. Logged in as {bot.user}')
     try:
-        # تسجيل الأوامر (Command Tree)
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")
-        # اختبار Dropbox
         dbx.users_get_current_account()
         print("Dropbox connection successful.")
     except Exception as e:
@@ -208,31 +223,27 @@ async def on_ready():
 
 @bot.tree.command(name="download", description="تحميل الصور من مواقع المانجا وضغطها ورفعها.")
 @discord.app_commands.describe(
-    url="رابط صفحة الفصل الأول (قد يحتوي على رقم الفصل أو لا)",
-    chapters="عدد الفصول التي تريد تنزيلها بدءاً من هذا الفصل",
-    merge_images="دمج الصور (صورتان في صورة واحدة)، يعمل فقط لـ JPG/JPEG",
-    output_format="صيغة الصورة النهائية (jpg أو webp)"
-)
-@discord.app_commands.choices(
-    output_format=[
-        discord.app_commands.Choice(name="JPG (أكثر توافقاً)", value="jpg"),
-        discord.app_commands.Choice(name="WEBP (أصغر حجماً)", value="webp"),
-        # يمكنك إضافة خيارات أخرى مثل png هنا
-    ]
+    url="رابط صفحة المانجا/الويبتون",
+    chapter_number="رقم الفصل الأول الذي سيبدأ به الترقيم (افتراضي 1)",
+    chapters="عدد الفصول المراد تحميلها (افتراضي 1)",
+    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: True)",
+    image_format="صيغة الإخراج المطلوبة (مثل: jpg, webp, png - افتراضي: jpg)"
 )
 async def download_command(
     interaction: discord.Interaction, 
     url: str,
-    chapters: int,
+    chapter_number: int = 1,
+    chapters: int = 1,       
     merge_images: bool = True,
-    output_format: str = "jpg"
+    image_format: str = "jpg"
 ):
     user_mention = interaction.user.mention
     
-    # التحقق من صيغة الإخراج المدعومة
-    if output_format not in ['jpg', 'webp']:
-         await interaction.response.send_message("❌ **صيغة الإخراج غير مدعومة.** الرجاء اختيار `jpg` أو `webp`.", ephemeral=True)
-         return
+    # التحقق من الصيغة المدخلة
+    if image_format.lower() not in VALID_FORMATS:
+        error_msg = f"❌ **صيغة الإخراج غير مدعومة!** الصيغ المدعومة هي: {', '.join(VALID_FORMATS)}."
+        await interaction.response.send_message(error_msg, ephemeral=True)
+        return
 
     initial_embed = discord.Embed(
         title="📥 تحميل فصل المانهوا",
@@ -247,60 +258,54 @@ async def download_command(
     driver = init_driver()
     if not driver:
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
-        await original_response.edit(embed=discord.Embed(title="❌ فشل التهيئة", description="**فشل في تهيئة متصفح Chrome/Selenium.**", color=discord.Color.red()))
+        await original_response.edit(embed=discord.Embed(title="❌ فشل التهيئة", description="**فشل في تهيئة متصفح Chrome/Selenium. الرجاء التحقق من إعدادات Buildpacks والتوزيع.**", color=discord.Color.red()))
         return
 
     # إنشاء مجلد العمل المؤقت
     if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
     
-    # --- تحليل الرابط واستخراج رقم الفصل الأول ---
+    # --- تحديد نطاق الفصول والروابط ---
+    base_url_pattern = url
+    url_contains_chapter_num = False
     
-    # 1. محاولة استخراج رقم الفصل من نمط 'chapter-XX'
-    match_chapter = re.search(r'chapter-(\d+)', url, re.IGNORECASE)
-    # 2. محاولة استخراج رقم الفصل من نمط 'no=XX' (لروابط Naver)
-    match_no = re.search(r'no=(\d+)', url, re.IGNORECASE)
+    # البحث عن نمط رقم الفصل (مثل chapter-XX, no=XX, epi=XX)
+    match = re.search(r'(chapter|no|epi)[\-_=]\d+', url, re.IGNORECASE)
     
-    if match_chapter:
-        initial_chapter_num = int(match_chapter.group(1))
-        # إنشاء نمط الرابط (مثل: /chapter-XX/ -> /chapter-{}/)
-        base_url_pattern = re.sub(r'chapter-\d+', 'chapter-{}', url, 1, re.IGNORECASE)
-        url_type = 'chapter'
-    elif match_no:
-        initial_chapter_num = int(match_no.group(1))
-        # إنشاء نمط الرابط (مثل: &no=XX& -> &no={}&)
-        base_url_pattern = re.sub(r'no=\d+', 'no={}', url, 1, re.IGNORECASE)
-        url_type = 'no'
-    else:
-        # فشل التحليل
-        shutil.rmtree(LOCAL_TEMP_DIR)
-        driver.quit()
-        print(f"[ERROR LOG] URL parsing failed: Could not find chapter number in URL: {url}")
-        await original_response.edit(content="❌ **فشل في تحليل الرابط!** لم يتم العثور على رقم فصل في الرابط (سواء `chapter-XX` أو `no=XX`).")
-        return
-
+    if match:
+        # استبدال رقم الفصل بنمط جاهز للتنسيق ({}). مثال: no=100 -> no-{}
+        base_url_pattern = re.sub(r'(chapter|no|epi)[\-_=]\d+', r'\1-{}', url, re.IGNORECASE)
+        url_contains_chapter_num = True
+    
+    # إذا لم يكن هناك نمط، يتم تحميل فصل واحد فقط من الرابط المباشر
+    if not url_contains_chapter_num and chapters > 1:
+        # إذا لم يكن الرابط قابلًا للترقيم، نلغي التحميل المتعدد ونبقي على الفصل الأول فقط
+        chapters = 1
+        initial_embed.description = f"⚠️ **تحذير:** لم يتم العثور على نمط ترقيم في الرابط. سيتم تحميل **فصل واحد** فقط.\n\n{user_mention} **جارِ جلب وتحميل الفصل رقم {chapter_number}...** ⏳"
+        await original_response.edit(embed=initial_embed)
+    
+    # نطاق الأرقام التي ستستخدم لتسمية المجلدات وتحديد URL (إذا كان قابلاً للترقيم)
+    chapter_range = range(chapter_number, chapter_number + chapters) 
+    
     chapters_processed = 0
     
     # --- حلقة معالجة الفصول ---
-    for i in range(chapters):
-        # في روابط Naver، يتم العد تنازليًا (مثل no=10, no=9, no=8) إذا كانت listSortOrder=DESC
-        # في هذه الحالة، نستخدم i-1. سنفترض أن الزيادة هي المتوقعة ما لم يتم تحديد عكس ذلك.
-        current_chapter_num = initial_chapter_num + i if url_type == 'chapter' else initial_chapter_num - i
+    for current_chapter_num in chapter_range:
         
-        # إذا كان رقم الفصل سالباً (للروابط التنازلية)، نتوقف
-        if current_chapter_num <= 0 and url_type != 'chapter':
-             print(f"[INFO] Stopped processing as chapter number reached {current_chapter_num}.")
-             break
-
-        current_url = base_url_pattern.format(current_chapter_num)
+        # تحديد الرابط الحالي
+        if url_contains_chapter_num:
+            # يتم استخدام current_chapter_num في الرابط إذا كان قابلاً للترقيم
+            current_url = base_url_pattern.format(current_chapter_num)
+        else:
+            # إذا لم يكن قابلاً للترقيم، يتم استخدام الرابط الأصلي طوال الوقت
+            current_url = url
+            
+        # يتم استخدام current_chapter_num لتسمية المجلد المحلي دائمًا
         local_chapter_folder = os.path.join(LOCAL_TEMP_DIR, str(current_chapter_num))
         images_downloaded = 0
         
         try:
-            initial_embed.description = (
-                f"{user_mention} **جارِ جلب الفصل {current_chapter_num} ({i + 1} من {chapters})...** ⏳\n"
-                f"الدمج: {'مفعّل' if merge_images else 'غير مفعّل'} | الإخراج: {output_format.upper()}"
-            )
+            initial_embed.description = f"{user_mention} **جارِ جلب وتحميل الفصل رقم {current_chapter_num}، الرجاء الانتظار...** ⏳"
             await original_response.edit(embed=initial_embed)
             
             os.makedirs(local_chapter_folder, exist_ok=True)
@@ -310,7 +315,7 @@ async def download_command(
             
             # الانتظار حتى تحميل أول صورة
             WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], #toon_view_detail img'))
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"]'))
             )
             
             # تمرير الصفحة للأسفل لضمان تحميل جميع الصور (Lazy Loading)
@@ -320,16 +325,10 @@ async def download_command(
             await asyncio.sleep(3) 
             
             # 2. استخراج روابط الصور
-            # توسيع نطاق البحث ليشمل موقع Naver (#toon_view_detail img)
-            image_elements = driver.find_elements(By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], #toon_view_detail img')
+            image_elements = driver.find_elements(By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"]')
             image_srcs = [img.get_attribute('src') for img in image_elements if img.get_attribute('src')]
             
             if not image_srcs: 
-                # محاولة ثانية إذا فشلت طريقة CSS Selector
-                body_html = driver.page_source
-                if "페이지를 찾을 수 없습니다" in body_html or "Page Not Found" in body_html:
-                    raise requests.exceptions.HTTPError("Chapter not found (404-like error).")
-
                 print(f"[ERROR LOG] No images found via Selenium in chapter {current_chapter_num} at URL: {current_url}")
                 shutil.rmtree(local_chapter_folder)
                 continue
@@ -339,42 +338,39 @@ async def download_command(
             for img_src in image_srcs:
                 if not img_src or img_src.startswith('data:'): continue
 
-                img_obj = download_and_check_image(img_src)
+                # تمرير صيغة الصورة المطلوبة
+                img_obj, ext, save_format = download_and_check_image(img_src, image_format)
                 
                 if img_obj:
-                    # نستخدم 'jpg' كصيغة مؤقتة للحفظ قبل الدمج، باستثناء ملفات PNG الأصلية
-                    ext = 'png' if img_obj.format == 'PNG' else 'jpg'
                     filename = f"{image_counter:03d}.{ext}"
                     local_file_path = os.path.join(local_chapter_folder, filename)
                     
-                    if ext == 'png':
-                        img_obj.save(local_file_path, 'png')
+                    # حفظ الصورة بالصيغة المطلوبة مع تحديد معايير الجودة
+                    if save_format in ['jpeg', 'webp']:
+                        img_obj.save(local_file_path, save_format, quality=90)
+                    elif save_format == 'png':
+                        # حفظ PNG بدون ضغط الجودة (يمكن استخدام compress_level=9)
+                        img_obj.save(local_file_path, 'png') 
                     else:
+                         # صيغة غير متوقعة
                         img_obj.save(local_file_path, 'jpeg', quality=90)
+
 
                     images_downloaded += 1
                     image_counter += 1
             
-            # 4. دمج وتحويل الصور
+            # 4. دمج الصور بعد التنزيل (اختياري)
             if images_downloaded > 0:
-                initial_embed.description = f"{user_mention} **جارِ دمج وتحويل الفصل {current_chapter_num}...** ⚙️"
-                await original_response.edit(embed=initial_embed)
-                
                 if merge_images:
-                    merge_chapter_images(local_chapter_folder, output_format) 
-                else:
-                    # إذا لم يكن هناك دمج، نقوم بالتحويل وإعادة الترقيم فقط
-                    merge_chapter_images(local_chapter_folder, output_format) 
-
+                    initial_embed.description = f"{user_mention} **جارِ دمج وضغط الفصل رقم {current_chapter_num}...** ⚙️"
+                    await original_response.edit(embed=initial_embed)
+                    merge_chapter_images(local_chapter_folder, image_format) 
+                    
                 chapters_processed += 1
             else:
                 print(f"[ERROR LOG] No images were successfully downloaded in chapter {current_chapter_num}.")
-                shutil.rmtree(local_chapter_folder)
+                if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
             
-        except requests.exceptions.HTTPError:
-            print(f"[ERROR LOG] Chapter URL Error: Chapter {current_chapter_num} likely does not exist (404). Stopping chapter loop.")
-            if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
-            break # الخروج من حلقة الفصول إذا كان الرابط غير موجود
         except TimeoutException:
             print(f"[ERROR LOG] Selenium Timeout: Page took too long to load images for chapter {current_chapter_num} (URL: {current_url}).")
             if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
@@ -453,13 +449,11 @@ async def download_command(
     # 4. رسالة النجاح النهائية
     final_embed = discord.Embed(
         title="✅ تم الرفع إلى Dropbox",
-        description=f"{user_mention} **تم رفع الملف بنجاح!**\n\n"
-                    f"**الملف المضغوط:** `{zip_filename}`\n"
-                    f"**الدمج:** {'نعم' if merge_images else 'لا'} | **الصيغة:** {output_format.upper()}\n"
-                    f"**رابط التحميل:** [اضغط هنا للتحميل]({shared_link})\n\n",
+        description=f"{user_mention} **تم رفع الملف بنجاح!**\n\n**رابط التحميل:**\n{shared_link}\n\n"
+                    f"**ملاحظة:** سيتم حذف الملف تلقائيًا بعد **{CLEANUP_DELAY_SECONDS // 60} دقيقة**.",
         color=discord.Color.green()
     )
-    final_embed.set_footer(text="سيتم حذف الملف من Dropbox بعد 15 دقيقة.")
+    final_embed.set_footer(text=f"تم معالجة {chapters_processed} فصل/فصول بنجاح. الصيغة: {image_format.upper()}. الدمج: {'مفعل' if merge_images else 'غير مفعل'}.")
     
     await original_response.edit(embed=final_embed)
 
