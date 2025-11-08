@@ -69,7 +69,8 @@ def init_driver():
         print("[INFO] Chrome Driver initialized successfully using Heroku static paths and Service object.")
         return driver
     except WebDriverException as e:
-        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
+        # فصل سبب الخطأ
+        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {type(e).__name__} - {e}")
         return None
 
 
@@ -78,7 +79,7 @@ def init_driver():
 def download_and_check_image(image_url, target_format="jpg"):
     """
     تحميل الصورة، التحقق من حجمها، وتحويلها لـ format المستهدف.
-    (تم إضافة User-Agent ومعالجة الأخطاء المحسّنة)
+    (تم تحسين تفاصيل الأخطاء)
     """
     target_format = target_format.lower()
     
@@ -117,12 +118,17 @@ def download_and_check_image(image_url, target_format="jpg"):
             print(f"[ERROR LOG] Skipping image {image_url}: Width {img.width}px is less than {MIN_WIDTH}px.")
             return None, None, None
             
+    except requests.exceptions.HTTPError as e:
+        # فصل سبب الخطأ: أخطاء HTTP (4xx, 5xx)
+        print(f"[ERROR LOG] HTTP Error processing image {image_url}: Status {e.response.status_code} - {e}")
+        return None, None, None
+    except requests.exceptions.Timeout:
+        # فصل سبب الخطأ: مهلة التحميل
+        print(f"[ERROR LOG] Timeout Error processing image {image_url}: Download timed out after {IMAGE_DOWNLOAD_TIMEOUT}s.")
+        return None, None, None
     except Exception as e:
-        if isinstance(e, requests.exceptions.HTTPError):
-            print(f"[ERROR LOG] HTTP Error processing image {image_url}: {e.response.status_code}")
-        else:
-            print(f"[ERROR LOG] General Error processing image {image_url}: {e}")
-            
+        # فصل سبب الخطأ: أخطاء عامة (مثل PIL)
+        print(f"[ERROR LOG] General Error processing image {image_url}: {type(e).__name__} - {e}")
         return None, None, None
 
 
@@ -174,7 +180,8 @@ def merge_chapter_images(chapter_folder: str, image_format: str):
             print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
 
         except Exception as e:
-            print(f"[ERROR LOG] Failed to merge images: {e}")
+            # فصل سبب الخطأ: فشل الدمج
+            print(f"[ERROR LOG] Failed to merge images: {type(e).__name__} - {e}")
             continue
 
     # إعادة ترقيم الملفات النهائية
@@ -188,10 +195,11 @@ def merge_chapter_images(chapter_folder: str, image_format: str):
             try:
                 os.rename(os.path.join(chapter_folder, filename), os.path.join(chapter_folder, new_filename))
             except Exception as e:
-                print(f"[ERROR LOG] Failed to rename file: {e}")
+                # فصل سبب الخطأ: فشل إعادة التسمية
+                print(f"[ERROR LOG] Failed to rename file: {type(e).__name__} - {e}")
 
 
-# --- مهمة المعالجة الطويلة (متزامنة - تم تعديلها للتعامل مع Lazy Loading) ---
+# --- مهمة المعالجة الطويلة (متزامنة - تم تحسين تفاصيل الأخطاء) ---
 def _process_manga_download(url, chapter_number, chapters, merge_images, image_format):
     """
     تحتوي على كل منطق الـ Selenium والملفات. تُشغل في خيط منفصل.
@@ -240,7 +248,7 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 
                 driver.get(current_url)
                 
-                # 3.1 الانتظار حتى تحميل أول صورة (يشمل انتظار data-src)
+                # 3.1 الانتظار حتى تحميل أول صورة
                 WebDriverWait(driver, 45).until( 
                     EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"], img[data-src]'))
                 )
@@ -265,22 +273,19 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                     last_height = new_height
                     scroll_attempts += 1
                 
-                # 3.3 استخلاص روابط الصور (البحث في src و data-src)
+                # 3.3 استخلاص روابط الصور
                 image_elements = driver.find_elements(By.TAG_NAME, 'img')
                 
                 image_srcs = []
                 for img in image_elements:
                     src = img.get_attribute('src')
-                    data_src = img.get_attribute('data-src') # لاقتناص Lazy Load
+                    data_src = img.get_attribute('data-src') 
                     
-                    # نستخدم data-src إذا كان موجوداً وغير فارغ
                     if data_src and not data_src.startswith('data:'):
                         image_srcs.append(data_src)
-                    # وإلا، نستخدم src إذا كان موجوداً وغير فارغ
                     elif src and not src.startswith('data:'):
                         image_srcs.append(src)
                         
-                # إزالة الروابط المكررة للحفاظ على الكفاءة
                 image_srcs = list(dict.fromkeys(image_srcs))
 
 
@@ -316,8 +321,19 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                     print(f"[ERROR LOG] No images were successfully downloaded in chapter {current_chapter_num}.")
                     if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 
+            except TimeoutException as e:
+                # فصل سبب الخطأ: فشل انتظار العنصر
+                print(f"[ERROR LOG] Chapter {current_chapter_num} failed (Selenium Timeout): Element not loaded within 45s. - {e}")
+                if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
+                continue
+            except NoSuchElementException as e:
+                # فصل سبب الخطأ: فشل العثور على العنصر
+                print(f"[ERROR LOG] Chapter {current_chapter_num} failed (Selenium Element Not Found): Cannot locate required image elements. - {e}")
+                if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
+                continue
             except Exception as e:
-                print(f"[ERROR LOG] Chapter {current_chapter_num} failed: {e}")
+                # فصل سبب الخطأ: أخطاء عامة داخل حلقة الفصل
+                print(f"[ERROR LOG] Chapter {current_chapter_num} failed (General): {type(e).__name__} - {e}")
                 if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 continue
         
@@ -366,7 +382,8 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         }
 
     except Exception as e:
-        print(f"[CRITICAL ERROR] Download task failed: {e}")
+        # فصل سبب الخطأ: خطأ فشل المهمة بالكامل
+        print(f"[CRITICAL ERROR] Download task failed: {type(e).__name__} - {e}")
         return {"success": False, "error": f"فشل العملية: {e}"}
         
     finally:
@@ -397,7 +414,7 @@ async def on_ready():
     url="رابط صفحة المانجا/الويبتون",
     chapter_number="رقم الفصل الأول الذي سيبدأ به الترقيم (افتراضي 1)",
     chapters="عدد الفصول المراد تحميلها (افتراضي 1)",
-    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: False)", # تم تغيير الافتراضي لتجنب الدمج الغير مرغوب فيه
+    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: False)", 
     image_format="صيغة الإخراج المطلوبة (مثل: jpg, webp, png - افتراضي: jpg)"
 )
 async def download_command(
@@ -438,7 +455,7 @@ async def download_command(
             image_format.lower()
         )
     except Exception as e:
-        print(f"[CRITICAL ERROR] asyncio.to_thread failed: {e}")
+        print(f"[CRITICAL ERROR] asyncio.to_thread failed: {type(e).__name__} - {e}")
         result = {"success": False, "error": f"فشل غير متوقع في الخادم: {e}"}
 
     # 3. معالجة النتائج وإرسال الرد النهائي
