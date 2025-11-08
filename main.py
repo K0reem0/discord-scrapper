@@ -18,7 +18,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 import requests
-import time # تم استيراد time لاستخدامه في مهام الخيط المنفصل
+import time 
 
 # --- الإعدادات والثوابت ---
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -73,11 +73,12 @@ def init_driver():
         return None
 
 
-# --- الدوال المساعدة ---
+# --- الدوال المساعدة (تم تعديل دالة تحميل الصور هنا) ---
 
 def download_and_check_image(image_url, target_format="jpg"):
     """
     تحميل الصورة، التحقق من حجمها، وتحويلها لـ format المستهدف.
+    (تم إضافة User-Agent ومعالجة الأخطاء المحسّنة)
     """
     target_format = target_format.lower()
     
@@ -93,15 +94,21 @@ def download_and_check_image(image_url, target_format="jpg"):
     else:
         save_format = 'jpeg'
         ext = 'jpg'
+        
+    # إضافة User-Agent لزيادة موثوقية التحميل
+    headers = {
+        "User-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+    }
 
     try:
-        response = requests.get(image_url, stream=True, timeout=IMAGE_DOWNLOAD_TIMEOUT)
+        response = requests.get(image_url, stream=True, timeout=IMAGE_DOWNLOAD_TIMEOUT, headers=headers)
         response.raise_for_status() 
         
         image_bytes = BytesIO(response.content)
         img = Image.open(image_bytes)
         
-        if save_format != 'png':
+        # التأكد من تحويل الصورة لـ RGB إذا لم تكن PNG
+        if save_format != 'png' and img.mode != 'RGB':
             img = img.convert("RGB")
         
         if img.width >= MIN_WIDTH:
@@ -111,7 +118,11 @@ def download_and_check_image(image_url, target_format="jpg"):
             return None, None, None
             
     except Exception as e:
-        print(f"[ERROR LOG] Error processing image {image_url}: {e}")
+        if isinstance(e, requests.exceptions.HTTPError):
+            print(f"[ERROR LOG] HTTP Error processing image {image_url}: {e.response.status_code}")
+        else:
+            print(f"[ERROR LOG] General Error processing image {image_url}: {e}")
+            
         return None, None, None
 
 
@@ -180,7 +191,7 @@ def merge_chapter_images(chapter_folder: str, image_format: str):
                 print(f"[ERROR LOG] Failed to rename file: {e}")
 
 
-# --- مهمة المعالجة الطويلة (متزامنة - تُشغَّل في خيط منفصل) ---
+# --- مهمة المعالجة الطويلة (متزامنة - تم تعديلها للتعامل مع Lazy Loading) ---
 def _process_manga_download(url, chapter_number, chapters, merge_images, image_format):
     """
     تحتوي على كل منطق الـ Selenium والملفات. تُشغل في خيط منفصل.
@@ -211,7 +222,6 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         
         if not url_contains_chapter_num and chapters > 1:
             chapters = 1
-            # يتم تجاهل رسالة التحذير هنا وإرسالها عبر Discord لاحقًا
 
         chapter_range = range(chapter_number, chapter_number + chapters) 
         
@@ -230,20 +240,52 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 
                 driver.get(current_url)
                 
-                # الانتظار حتى تحميل أول صورة
-                WebDriverWait(driver, 45).until( # زيادة مهلة الانتظار إلى 45 ثانية
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"]'))
+                # 3.1 الانتظار حتى تحميل أول صورة (يشمل انتظار data-src)
+                WebDriverWait(driver, 45).until( 
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"], img[data-src]'))
                 )
                 
-                # تمرير الصفحة للأسفل لضمان تحميل جميع الصور (Lazy Loading)
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(3) # استخدام time.sleep آمن هنا لأنه في خيط منفصل
+                # 3.2 التمرير لأسفل الصفحة للتعامل مع Lazy Loading
+                last_height = driver.execute_script("return document.body.scrollHeight")
+                scroll_attempts = 0
+                max_scrolls = 10 
                 
-                image_elements = driver.find_elements(By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"]')
-                image_srcs = [img.get_attribute('src') for img in image_elements if img.get_attribute('src')]
+                while scroll_attempts < max_scrolls:
+                    # التمرير لأسفل
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(3) # الانتظار لتحميل الصور الجديدة
+                    
+                    # حساب الارتفاع الجديد بعد التمرير
+                    new_height = driver.execute_script("return document.body.scrollHeight")
+                    
+                    if new_height == last_height:
+                        # لم يتم تحميل المزيد من المحتوى، نتوقف
+                        break
+                        
+                    last_height = new_height
+                    scroll_attempts += 1
                 
+                # 3.3 استخلاص روابط الصور (البحث في src و data-src)
+                image_elements = driver.find_elements(By.TAG_NAME, 'img')
+                
+                image_srcs = []
+                for img in image_elements:
+                    src = img.get_attribute('src')
+                    data_src = img.get_attribute('data-src') # لاقتناص Lazy Load
+                    
+                    # نستخدم data-src إذا كان موجوداً وغير فارغ
+                    if data_src and not data_src.startswith('data:'):
+                        image_srcs.append(data_src)
+                    # وإلا، نستخدم src إذا كان موجوداً وغير فارغ
+                    elif src and not src.startswith('data:'):
+                        image_srcs.append(src)
+                        
+                # إزالة الروابط المكررة للحفاظ على الكفاءة
+                image_srcs = list(dict.fromkeys(image_srcs))
+
+
                 if not image_srcs: 
-                    print(f"[ERROR LOG] No images found via Selenium in chapter {current_chapter_num}")
+                    print(f"[ERROR LOG] No unique image URLs found in chapter {current_chapter_num}")
                     if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                     continue
                 
@@ -355,7 +397,7 @@ async def on_ready():
     url="رابط صفحة المانجا/الويبتون",
     chapter_number="رقم الفصل الأول الذي سيبدأ به الترقيم (افتراضي 1)",
     chapters="عدد الفصول المراد تحميلها (افتراضي 1)",
-    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: True)",
+    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: False)", # تم تغيير الافتراضي لتجنب الدمج الغير مرغوب فيه
     image_format="صيغة الإخراج المطلوبة (مثل: jpg, webp, png - افتراضي: jpg)"
 )
 async def download_command(
