@@ -236,9 +236,24 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 
                 # 3.1 الانتظار حتى تحميل أول صورة
                 # تم التعديل هنا: إضافة مُحدد الـ ID: img[id^="image-"]
+               # --- مهمة المعالجة الطويلة (إعادة استخدام المحددات المفصلة) ---
+
+# ...
+                
+                # 3.1 الانتظار حتى تحميل أول صورة
+                # المحددات التفصيلية: img.ts-main-image، img.w-full.object-contain، img.toon_image، إلخ.
                 WebDriverWait(driver, 60).until( 
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'img.ts-main-image, img.w-full.object-contain, img.toon_image, img[id^="image-"], img[src*="cdn"], img[data-src], img[src*="data"]'))
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 
+                        'img.ts-main-image, '          # الكلاس الأول
+                        'img.w-full.object-contain, '  # الكلاس الذي أشرت إليه 
+                        'img.toon_image, '             # الكلاس الثالث
+                        'img[id^="image-"], '          # محدد الـ ID
+                        'img[src*="cdn"], '            # محدد السمة: يحتوي على cdn
+                        'img[data-src], '              # محدد السمة: يحتوي على data-src
+                        'img[src*="data"]'             # محدد السمة: يحتوي على data (لمواقع تستخدم data URI)
+                    ))
                 )
+# ...
                 
                 # 3.2 التمرير لأسفل الصفحة للتعامل مع Lazy Loading
                 last_height = driver.execute_script("return document.body.scrollHeight")
