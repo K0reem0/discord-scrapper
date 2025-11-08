@@ -36,7 +36,7 @@ intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 dbx = dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
 
-# --- دالة تهيئة متصفح Selenium (مُثبتة لـ Heroku) ---
+# --- دالة تهيئة متصفح Selenium ---
 def init_driver():
     """
     تهيئة متصفح Chrome في وضع Headless.
@@ -56,30 +56,27 @@ def init_driver():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    # زيادة المهلة لانتظار تحميل الصفحة
-    chrome_options.page_load_strategy = 'normal' 
+    # استراتيجية تحميل الصفحة
+    chrome_options.page_load_strategy = 'eager'
     
     chrome_options.binary_location = chrome_bin 
 
     try:
         service = Service(executable_path=chromedriver_path)
-        # زيادة مهلة تشغيل المتصفح إلى 60 ثانية
         driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(60) # مهلة تحميل الصفحة
+        driver.set_page_load_timeout(60)
         print("[INFO] Chrome Driver initialized successfully using Heroku static paths and Service object.")
         return driver
     except WebDriverException as e:
-        # فصل سبب الخطأ
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {type(e).__name__} - {e}")
         return None
 
 
-# --- الدوال المساعدة (تم تعديل دالة تحميل الصور هنا) ---
+# --- الدوال المساعدة ---
 
 def download_and_check_image(image_url, target_format="jpg"):
     """
     تحميل الصورة، التحقق من حجمها، وتحويلها لـ format المستهدف.
-    (تم تحسين تفاصيل الأخطاء)
     """
     target_format = target_format.lower()
     
@@ -96,7 +93,6 @@ def download_and_check_image(image_url, target_format="jpg"):
         save_format = 'jpeg'
         ext = 'jpg'
         
-    # إضافة User-Agent لزيادة موثوقية التحميل
     headers = {
         "User-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
     }
@@ -108,7 +104,6 @@ def download_and_check_image(image_url, target_format="jpg"):
         image_bytes = BytesIO(response.content)
         img = Image.open(image_bytes)
         
-        # التأكد من تحويل الصورة لـ RGB إذا لم تكن PNG
         if save_format != 'png' and img.mode != 'RGB':
             img = img.convert("RGB")
         
@@ -119,20 +114,16 @@ def download_and_check_image(image_url, target_format="jpg"):
             return None, None, None
             
     except requests.exceptions.HTTPError as e:
-        # فصل سبب الخطأ: أخطاء HTTP (4xx, 5xx)
         print(f"[ERROR LOG] HTTP Error processing image {image_url}: Status {e.response.status_code} - {e}")
         return None, None, None
     except requests.exceptions.Timeout:
-        # فصل سبب الخطأ: مهلة التحميل
         print(f"[ERROR LOG] Timeout Error processing image {image_url}: Download timed out after {IMAGE_DOWNLOAD_TIMEOUT}s.")
         return None, None, None
     except Exception as e:
-        # فصل سبب الخطأ: أخطاء عامة (مثل PIL)
         print(f"[ERROR LOG] General Error processing image {image_url}: {type(e).__name__} - {e}")
         return None, None, None
 
 
-# دالة التنظيف تبقى كما هي (Async)
 async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
     """ينتظر 15 دقيقة ثم يحذف الملف المضغوط من Dropbox."""
     await asyncio.sleep(delay_seconds)
@@ -144,9 +135,7 @@ async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
 
 
 def merge_chapter_images(chapter_folder: str, image_format: str):
-    """
-    تنفذ دمج الصور لملفات JPG/JPEG فقط.
-    """
+    """تنفذ دمج الصور لملفات JPG/JPEG فقط."""
     if image_format.lower() not in ['jpg', 'jpeg']:
         print(f"[INFO] Skipping merge: Merge is only supported for JPG/JPEG format.")
         return
@@ -180,7 +169,6 @@ def merge_chapter_images(chapter_folder: str, image_format: str):
             print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
 
         except Exception as e:
-            # فصل سبب الخطأ: فشل الدمج
             print(f"[ERROR LOG] Failed to merge images: {type(e).__name__} - {e}")
             continue
 
@@ -195,11 +183,10 @@ def merge_chapter_images(chapter_folder: str, image_format: str):
             try:
                 os.rename(os.path.join(chapter_folder, filename), os.path.join(chapter_folder, new_filename))
             except Exception as e:
-                # فصل سبب الخطأ: فشل إعادة التسمية
                 print(f"[ERROR LOG] Failed to rename file: {type(e).__name__} - {e}")
 
 
-# --- مهمة المعالجة الطويلة (متزامنة - تم تحسين تفاصيل الأخطاء) ---
+# --- مهمة المعالجة الطويلة (تم تحديث محددات CSS) ---
 def _process_manga_download(url, chapter_number, chapters, merge_images, image_format):
     """
     تحتوي على كل منطق الـ Selenium والملفات. تُشغل في خيط منفصل.
@@ -208,7 +195,6 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
     driver = None
     chapters_processed = 0
     
-    # تنظيف المجلد المؤقت قبل البدء
     if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
     os.makedirs(LOCAL_TEMP_DIR, exist_ok=True)
     
@@ -249,8 +235,9 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 driver.get(current_url)
                 
                 # 3.1 الانتظار حتى تحميل أول صورة
-                WebDriverWait(driver, 45).until( 
-                    EC.presence_of_element_located((By.CSS_SELECTOR, 'img.page-image, img[src*="cdn"], img[src*="data"], img[data-src]'))
+                # تم التعديل هنا: إضافة مُحدد الـ ID: img[id^="image-"]
+                WebDriverWait(driver, 60).until( 
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'img.ts-main-image, img.w-full.object-contain, img.toon_image, img[id^="image-"], img[src*="cdn"], img[data-src], img[src*="data"]'))
                 )
                 
                 # 3.2 التمرير لأسفل الصفحة للتعامل مع Lazy Loading
@@ -259,15 +246,12 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 max_scrolls = 10 
                 
                 while scroll_attempts < max_scrolls:
-                    # التمرير لأسفل
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                    time.sleep(3) # الانتظار لتحميل الصور الجديدة
+                    time.sleep(3) 
                     
-                    # حساب الارتفاع الجديد بعد التمرير
                     new_height = driver.execute_script("return document.body.scrollHeight")
                     
                     if new_height == last_height:
-                        # لم يتم تحميل المزيد من المحتوى، نتوقف
                         break
                         
                     last_height = new_height
@@ -281,6 +265,7 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                     src = img.get_attribute('src')
                     data_src = img.get_attribute('data-src') 
                     
+                    # الأولوية لـ data-src إذا كان موجوداً
                     if data_src and not data_src.startswith('data:'):
                         image_srcs.append(data_src)
                     elif src and not src.startswith('data:'):
@@ -322,17 +307,14 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                     if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 
             except TimeoutException as e:
-                # فصل سبب الخطأ: فشل انتظار العنصر
-                print(f"[ERROR LOG] Chapter {current_chapter_num} failed (Selenium Timeout): Element not loaded within 45s. - {e}")
+                print(f"[ERROR LOG] Chapter {current_chapter_num} failed (Selenium Timeout): Element not loaded within 60s. - {e}")
                 if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 continue
             except NoSuchElementException as e:
-                # فصل سبب الخطأ: فشل العثور على العنصر
                 print(f"[ERROR LOG] Chapter {current_chapter_num} failed (Selenium Element Not Found): Cannot locate required image elements. - {e}")
                 if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 continue
             except Exception as e:
-                # فصل سبب الخطأ: أخطاء عامة داخل حلقة الفصل
                 print(f"[ERROR LOG] Chapter {current_chapter_num} failed (General): {type(e).__name__} - {e}")
                 if os.path.exists(local_chapter_folder): shutil.rmtree(local_chapter_folder)
                 continue
@@ -345,7 +327,6 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         zip_filename = f"manga_{unique_id}.zip"
         local_zip_path = os.path.join(os.getcwd(), zip_filename)
 
-        # الضغط
         with zipfile.ZipFile(local_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(LOCAL_TEMP_DIR):
                 for file in files:
@@ -353,12 +334,10 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                     arcname = os.path.relpath(file_path, LOCAL_TEMP_DIR)
                     zipf.write(file_path, arcname)
         
-        # الرفع إلى Dropbox
         dropbox_path = f"/{zip_filename}"
         with open(local_zip_path, 'rb') as f:
             dbx.files_upload(f.read(), dropbox_path, mode=dropbox.files.WriteMode('overwrite'))
 
-        # إنشاء رابط المشاركة
         shared_link = ""
         try:
             shared_link_metadata = dbx.sharing_create_shared_link_with_settings(dropbox_path)
@@ -371,7 +350,6 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
             else:
                 shared_link = "(فشل إنشاء رابط مشاركة)"
 
-        # إرجاع النتائج للواجهة غير المتزامنة
         return {
             "success": True, 
             "shared_link": shared_link, 
@@ -382,21 +360,18 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         }
 
     except Exception as e:
-        # فصل سبب الخطأ: خطأ فشل المهمة بالكامل
         print(f"[CRITICAL ERROR] Download task failed: {type(e).__name__} - {e}")
         return {"success": False, "error": f"فشل العملية: {e}"}
         
     finally:
-        # التنظيف النهائي
         if driver: driver.quit()
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
 
 
-# --- أحداث البوت ---
+# --- أحداث البوت وأمر التطبيق (لم يتم تغييرها) ---
 
 @bot.event
 async def on_ready():
-    # ... (كما هو) ...
     print(f'Bot is ready. Logged in as {bot.user}')
     try:
         synced = await bot.tree.sync()
@@ -406,8 +381,6 @@ async def on_ready():
     except Exception as e:
         print(f"Dropbox connection failed or slash commands sync failed: {e}")
 
-
-# --- أمر التطبيق (Slash Command) ---
 
 @bot.tree.command(name="download", description="تحميل الصور من مواقع المانجا وضغطها ورفعها.")
 @discord.app_commands.describe(
@@ -427,7 +400,6 @@ async def download_command(
 ):
     user_mention = interaction.user.mention
     
-    # 1. التحقق الأولي
     if image_format.lower() not in VALID_FORMATS:
         error_msg = f"❌ **صيغة الإخراج غير مدعومة!** الصيغ المدعومة هي: {', '.join(VALID_FORMATS)}."
         await interaction.response.send_message(error_msg, ephemeral=True)
@@ -439,13 +411,10 @@ async def download_command(
         color=discord.Color.dark_grey()
     )
     
-    # يجب إرسال الرد المبدئي بسرعة قبل البدء بالمهمة الطويلة
     await interaction.response.send_message(embed=initial_embed, ephemeral=False)
     original_response = await interaction.original_response()
 
-    # 2. تنفيذ المهمة الطويلة في خيط منفصل (يمنع حظر الـ Heartbeat)
     try:
-        # استخدام asyncio.to_thread لتشغيل الدالة المتزامنة في خيط العامل
         result = await asyncio.to_thread(
             _process_manga_download,
             url,
@@ -458,12 +427,9 @@ async def download_command(
         print(f"[CRITICAL ERROR] asyncio.to_thread failed: {type(e).__name__} - {e}")
         result = {"success": False, "error": f"فشل غير متوقع في الخادم: {e}"}
 
-    # 3. معالجة النتائج وإرسال الرد النهائي
     if result["success"]:
-        # تنظيف الملف المضغوط محليًا بعد نجاح الرفع
         if os.path.exists(result["zip_path"]): os.remove(result["zip_path"])
         
-        # جدولة مهمة حذف ملف Dropbox
         bot.loop.create_task(cleanup_dropbox_file(result["dropbox_path"], CLEANUP_DELAY_SECONDS))
         
         final_embed = discord.Embed(
@@ -473,7 +439,6 @@ async def download_command(
             color=discord.Color.green()
         )
         footer_text = f"تم معالجة {result['chapters_processed']} فصل/فصول بنجاح. الصيغة: {image_format.upper()}. الدمج: {'مفعل' if merge_images else 'غير مفعل'}."
-        # إضافة تحذير إذا تم تعديل عدد الفصول إلى 1
         if result.get('url_was_fixed'):
             footer_text += " (تحذير: تم تحميل فصل واحد فقط لعدم وجود نمط ترقيم واضح)."
             
