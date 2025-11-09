@@ -242,15 +242,19 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 
                 # 3.1 الانتظار حتى تحميل أول صورة
                 # المحددات التفصيلية: img.ts-main-image، img.w-full.object-contain، img.toon_image، إلخ.
+               # 3.1 الانتظار حتى تحميل أول صورة (الأكثر شمولاً)
+                # إضافة img.wp-manga-chapter-img لتغطية مواقع ووردبريس
                 WebDriverWait(driver, 60).until( 
                     EC.presence_of_element_located((By.CSS_SELECTOR, 
-                        'img.ts-main-image, '          # الكلاس الأول
-                        'img.w-full.object-contain, '  # الكلاس الذي أشرت إليه 
-                        'img.toon_image, '             # الكلاس الثالث
-                        'img[id^="image-"], '          # محدد الـ ID
-                        'img[src*="cdn"], '            # محدد السمة: يحتوي على cdn
-                        'img[data-src], '              # محدد السمة: يحتوي على data-src
-                        'img[src*="data"]'             # محدد السمة: يحتوي على data (لمواقع تستخدم data URI)
+                        'img.ts-main-image, '          
+                        'img.w-full.object-contain, '  
+                        'img.toon_image, '             
+                        'div.reader__item img, '        
+                        'img.wp-manga-chapter-img, '    # هذا هو الإضافة الجديدة
+                        'img[id^="image-"], '          
+                        'img[src*="cdn"], '            
+                        'img[data-src], '              
+                        'img[data-original]'           
                     ))
                 )
 # ...
