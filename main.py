@@ -25,10 +25,14 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN")
 
 MIN_WIDTH = 650
-CLEANUP_DELAY_SECONDS = 1800
+CLEANUP_DELAY_SECONDS = 1800 # 30 دقيقة
 LOCAL_TEMP_DIR = "manga_temp" 
 IMAGE_DOWNLOAD_TIMEOUT = 30 
 VALID_FORMATS = ['jpg', 'jpeg', 'webp', 'png']
+
+# ثوابت الدمج الجديدة
+MIN_MERGE_HEIGHT = 15000 # الحد الأدنى للطول المطلوب للدمج بالبكسل
+MAX_MERGE_HEIGHT = 28000 # الحد الأقصى للطول المسموح به للصورة المدمجة بالبكسل
 
 # إعداد البوت
 intents = discord.Intents.default()
@@ -125,7 +129,7 @@ def download_and_check_image(image_url, target_format="jpg"):
 
 
 async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
-    """ينتظر 15 دقيقة ثم يحذف الملف المضغوط من Dropbox."""
+    """ينتظر مدة محددة ثم يحذف الملف المضغوط من Dropbox."""
     await asyncio.sleep(delay_seconds)
     try:
         dbx.files_delete_v2(dropbox_path)
@@ -133,46 +137,117 @@ async def cleanup_dropbox_file(dropbox_path: str, delay_seconds: int):
     except Exception as e:
         print(f"❌ فشل حذف ملف ZIP ({dropbox_path}): {e}")
 
+def save_merged_image(chapter_folder, first_file_name, current_merge_list, files_to_delete):
+    """
+    تأخذ قائمة بالصور المجمعة وتقوم بدمجها وحفظها
+    """
+    if not current_merge_list: return
+    
+    first_file_path = os.path.join(chapter_folder, first_file_name)
+    
+    # 1. استخراج كائنات الصور
+    images_to_paste = [item['img'] for item in current_merge_list]
+    
+    # 2. حساب الأبعاد
+    max_width = max(img.width for img in images_to_paste)
+    total_height = sum(img.height for img in images_to_paste)
+    
+    # 3. إنشاء الصورة المدمجة
+    merged_img = Image.new('RGB', (max_width, total_height))
+    
+    # 4. لصق الصور
+    y_offset = 0
+    for img in images_to_paste:
+        merged_img.paste(img, (0, y_offset)) 
+        y_offset += img.height
+
+    # 5. حفظ الصورة المدمجة فوق أول صورة في المجموعة
+    try:
+        # استخدام جودة عالية لصور المانجا
+        merged_img.save(first_file_path, 'jpeg', quality=90) 
+        print(f"✅ Merged {len(current_merge_list)} images into {first_file_name} (Total H: {total_height}px).")
+        
+        # 6. إضافة أسماء الملفات التي تم دمجها (باستثناء الأول) للحذف
+        for item in current_merge_list[1:]:
+            files_to_delete.add(item['filename'])
+            
+    except Exception as e:
+        print(f"[ERROR LOG] Failed to save merged image {first_file_name}: {type(e).__name__} - {e}")
+        pass
+
 
 def merge_chapter_images(chapter_folder: str, image_format: str):
-    """تنفذ دمج الصور لملفات JPG/JPEG فقط."""
+    """
+    تنفذ دمج الصور لملفات JPG/JPEG فقط، مع التحقق من شروط الطول.
+    """
     if image_format.lower() not in ['jpg', 'jpeg']:
         print(f"[INFO] Skipping merge: Merge is only supported for JPG/JPEG format.")
         return
 
+    # 1. قائمة بملفات JPG/JPEG بترتيب صحيح
     jpeg_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(('.jpg', '.jpeg'))])
-    
     num_jpeg = len(jpeg_files)
-    merge_list = [] 
     
-    i = 0
-    while i + 1 < num_jpeg:
-        file1_path = os.path.join(chapter_folder, jpeg_files[i])
-        file2_path = os.path.join(chapter_folder, jpeg_files[i+1])
-        merge_list.append((file1_path, file2_path))
-        i += 2
-        
-    for file1_path, file2_path in merge_list:
-        try:
-            img1 = Image.open(file1_path).convert("RGB") 
-            img2 = Image.open(file2_path).convert("RGB")
-            
-            max_width = max(img1.width, img2.width)
-            total_height = img1.height + img2.height
-            
-            merged_img = Image.new('RGB', (max_width, total_height))
-            merged_img.paste(img1, (0, 0)) 
-            merged_img.paste(img2, (0, img1.height)) 
-            
-            merged_img.save(file1_path, 'jpeg', quality=90) 
-            os.remove(file2_path)
-            print(f"Merged {os.path.basename(file1_path)} and {os.path.basename(file2_path)}")
+    if num_jpeg < 2:
+        print("[INFO] Not enough images to attempt merge.")
+        return
 
+    # 2. عملية الدمج والتجميع
+    files_to_delete = set() 
+    current_merge_list = [] 
+    current_total_height = 0
+    current_max_width = 0
+    
+    print(f"[INFO] Starting complex merge logic for {num_jpeg} images...")
+
+    for i, filename in enumerate(jpeg_files):
+        file_path = os.path.join(chapter_folder, filename)
+        
+        try:
+            # يجب فتح الصور لمرة واحدة فقط
+            img = Image.open(file_path).convert("RGB")
+            
+            # حالة 1: تجاوز الحد الأقصى للطول
+            if current_total_height + img.height > MAX_MERGE_HEIGHT and current_total_height >= MIN_MERGE_HEIGHT:
+                
+                # إتمام وحفظ الدمج السابق
+                if current_merge_list:
+                    first_file_name = current_merge_list[0]['filename']
+                    save_merged_image(chapter_folder, first_file_name, current_merge_list, files_to_delete)
+                
+                # البدء في قائمة دمج جديدة بالصورة الحالية
+                current_merge_list = [{'img': img, 'filename': filename}]
+                current_total_height = img.height
+                current_max_width = img.width
+            
+            # حالة 2: الاستمرار في الإضافة
+            else:
+                current_merge_list.append({'img': img, 'filename': filename})
+                current_total_height += img.height
+                current_max_width = max(current_max_width, img.width)
+                
+            # حالة 3: نهاية القائمة (يجب حفظ الدمج الحالي، مع مراعاة شرط الحد الأدنى)
+            if i == num_jpeg - 1:
+                if current_total_height >= MIN_MERGE_HEIGHT:
+                    first_file_name = current_merge_list[0]['filename']
+                    save_merged_image(chapter_folder, first_file_name, current_merge_list, files_to_delete)
+                else:
+                    print(f"[INFO] Last images skipped merge (Total height {current_total_height}px < {MIN_MERGE_HEIGHT}px).")
+            
         except Exception as e:
-            print(f"[ERROR LOG] Failed to merge images: {type(e).__name__} - {e}")
+            print(f"[ERROR LOG] Failed to process image {filename}: {type(e).__name__} - {e}")
             continue
 
-    # إعادة ترقيم الملفات النهائية
+    # 3. حذف الملفات التي تم دمجها
+    for filename in files_to_delete:
+        file_path = os.path.join(chapter_folder, filename)
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"[ERROR LOG] Failed to delete merged file {filename}: {e}")
+
+    # 4. إعادة ترقيم الملفات النهائية
     final_files = sorted([f for f in os.listdir(chapter_folder) if f.lower().endswith(tuple(VALID_FORMATS))])
     
     for index, filename in enumerate(final_files):
@@ -211,11 +286,13 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         match = re.search(r'(chapter|no|epi)[\-_=]\d+', url, re.IGNORECASE)
         
         if match:
-            base_url_pattern = re.sub(r'(chapter|no|epi)[\-_=]\d+', r'\1-{}', url, re.IGNORECASE)
+            # استخدام group(1) لضمان مطابقة نمط الترقيم
+            base_url_pattern = re.sub(r'((chapter|no|epi)[\-_=])\d+', r'\1{}', url, re.IGNORECASE)
             url_contains_chapter_num = True
         
         if not url_contains_chapter_num and chapters > 1:
-            chapters = 1
+            # إذا لم يتم العثور على رقم فصل في الرابط، يتم تحميل فصل واحد فقط
+            chapters = 1 
 
         chapter_range = range(chapter_number, chapter_number + chapters) 
         
@@ -234,30 +311,20 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 
                 driver.get(current_url)
                 
-                # 3.1 الانتظار حتى تحميل أول صورة
-                # تم التعديل هنا: إضافة مُحدد الـ ID: img[id^="image-"]
-               # --- مهمة المعالجة الطويلة (إعادة استخدام المحددات المفصلة) ---
-
-# ...
-                
-                # 3.1 الانتظار حتى تحميل أول صورة
-                # المحددات التفصيلية: img.ts-main-image، img.w-full.object-contain، img.toon_image، إلخ.
-               # 3.1 الانتظار حتى تحميل أول صورة (الأكثر شمولاً)
-                # إضافة img.wp-manga-chapter-img لتغطية مواقع ووردبريس
+                # 3.1 الانتظار حتى تحميل أول صورة (مُحددات شاملة ومُحدثة)
                 WebDriverWait(driver, 60).until( 
                     EC.presence_of_element_located((By.CSS_SELECTOR, 
                         'img.ts-main-image, '          
                         'img.w-full.object-contain, '  
                         'img.toon_image, '             
                         'div.reader__item img, '        
-                        'img.wp-manga-chapter-img, '    # هذا هو الإضافة الجديدة
+                        'img.wp-manga-chapter-img, '    
                         'img[id^="image-"], '          
                         'img[src*="cdn"], '            
                         'img[data-src], '              
                         'img[data-original]'           
                     ))
                 )
-# ...
                 
                 # 3.2 التمرير لأسفل الصفحة للتعامل مع Lazy Loading
                 last_height = driver.execute_script("return document.body.scrollHeight")
@@ -387,7 +454,7 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
         if os.path.exists(LOCAL_TEMP_DIR): shutil.rmtree(LOCAL_TEMP_DIR)
 
 
-# --- أحداث البوت وأمر التطبيق (لم يتم تغييرها) ---
+# --- أحداث البوت وأمر التطبيق ---
 
 @bot.event
 async def on_ready():
@@ -406,7 +473,7 @@ async def on_ready():
     url="رابط صفحة المانجا/الويبتون",
     chapter_number="رقم الفصل الأول الذي سيبدأ به الترقيم (افتراضي 1)",
     chapters="عدد الفصول المراد تحميلها (افتراضي 1)",
-    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - افتراضي: False)", 
+    merge_images="دمج الصور المزدوجة في كل فصل (JPG فقط - يتم الدمج بمعايير طول)", 
     image_format="صيغة الإخراج المطلوبة (مثل: jpg, webp, png - افتراضي: jpg)"
 )
 async def download_command(
@@ -457,7 +524,8 @@ async def download_command(
                         f"**ملاحظة:** سيتم حذف الملف تلقائيًا بعد **{CLEANUP_DELAY_SECONDS // 60} دقيقة**.",
             color=discord.Color.green()
         )
-        footer_text = f"تم معالجة {result['chapters_processed']} فصل/فصول بنجاح. الصيغة: {image_format.upper()}. الدمج: {'مفعل' if merge_images else 'غير مفعل'}."
+        merge_info = f" الدمج (الطول: {MIN_MERGE_HEIGHT}-{MAX_MERGE_HEIGHT}px): {'مفعل' if merge_images else 'غير مفعل'}."
+        footer_text = f"تم معالجة {result['chapters_processed']} فصل/فصول بنجاح. الصيغة: {image_format.upper()}." + merge_info
         if result.get('url_was_fixed'):
             footer_text += " (تحذير: تم تحميل فصل واحد فقط لعدم وجود نمط ترقيم واضح)."
             
@@ -472,5 +540,5 @@ async def download_command(
         )
         await original_response.edit(embed=error_embed)
 
-# تشغيل البوت
-bot.run(DISCORD_BOT_TOKEN)
+# تشغيل البوت (تأكد من إعداد متغير البيئة DISCORD_BOT_TOKEN)
+# bot.run(DISCORD_BOT_TOKEN)
