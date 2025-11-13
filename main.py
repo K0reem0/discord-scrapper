@@ -306,6 +306,8 @@ def _process_manga_download(url, chapter_number, chapters, merge_images, image_f
                 # 3.1 الانتظار حتى تحميل أول صورة (المحددات الأكثر شمولاً)
                 WebDriverWait(driver, 60).until( 
                     EC.presence_of_element_located((By.CSS_SELECTOR, 
+                        'div#chapter-reader img, '
+                        'div.chapter-reader img, '
                         'img.ts-main-image, '          
                         'img.w-full.object-contain, '  
                         'img.toon_image, '             
