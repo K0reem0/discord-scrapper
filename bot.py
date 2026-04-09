@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 import base64
+import aiohttp
 from io import BytesIO
 from PIL import Image
 
@@ -17,7 +18,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import WebDriverException
+from selenium.common.exceptions import WebDriverException, StaleElementReferenceException
 
 # --- الإعدادات ---
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -60,7 +61,6 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # هيروكو يعين الـ PORT تلقائياً، إذا لم يجده سيستخدم 8080 محلياً
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
@@ -105,51 +105,71 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
             EC.presence_of_element_located((By.TAG_NAME, 'img'))
         )
         
-        last_height = 0
         scroll_attempts = 0
+        max_attempts = 1500  # زيادة الحد لدعم الملفات التي تصل لـ 1000+ صفحة
+        empty_scrolls = 0    # عداد لمعرفة متى نصل لنهاية الملف
         
-        while scroll_attempts < 15:
+        print(f"[INFO] Starting to extract document: {output_filename}")
+        
+        while scroll_attempts < max_attempts:
+            # 1. إحضار العناصر الموجودة في الصفحة *حالياً*
             img_elements = driver.find_elements(By.TAG_NAME, 'img')
+            extracted_in_this_pass = False
             
             for img in img_elements:
-                src = img.get_attribute('src')
-                check_url_string = "blob:https://drive.google.com/"
-                
-                if src and src.startswith(check_url_string) and src not in processed_urls:
-                    driver.execute_script("arguments[0].scrollIntoView(true);", img)
-                    time.sleep(0.5) 
+                try:
+                    src = img.get_attribute('src')
+                    check_url_string = "blob:https://drive.google.com/"
                     
-                    b64_data = driver.execute_script("""
-                        var img = arguments[0];
-                        if (img.naturalWidth === 0) return null;
+                    if src and src.startswith(check_url_string) and src not in processed_urls:
+                        # النزول للصورة لضمان تحميلها بأعلى جودة
+                        driver.execute_script("arguments[0].scrollIntoView(true);", img)
+                        time.sleep(1) # انتظار ثانية لتكتمل الدقة
                         
-                        var canvasElement = document.createElement("canvas");
-                        var con = canvasElement.getContext("2d");
-                        canvasElement.width = img.naturalWidth;
-                        canvasElement.height = img.naturalHeight;
+                        b64_data = driver.execute_script("""
+                            var img = arguments[0];
+                            if (img.naturalWidth === 0) return null;
+                            
+                            var canvasElement = document.createElement("canvas");
+                            var con = canvasElement.getContext("2d");
+                            canvasElement.width = img.naturalWidth;
+                            canvasElement.height = img.naturalHeight;
+                            
+                            con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
+                            return canvasElement.toDataURL('image/png');
+                        """, img)
                         
-                        con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
-                        return canvasElement.toDataURL('image/png');
-                    """, img)
-                    
-                    if b64_data:
-                        images_base64.append(b64_data)
-                        processed_urls.add(src)
+                        if b64_data:
+                            images_base64.append(b64_data)
+                            processed_urls.add(src)
+                            extracted_in_this_pass = True
+                            empty_scrolls = 0
+                            
+                            # ⚠️ كسر الحلقة هنا مهم جداً: لتحديث عناصر الصفحة وتفادي خطأ Stale Element
+                            break 
+                            
+                except StaleElementReferenceException:
+                    # إذا اختفت الصورة أثناء المحاولة، نكسر الحلقة لنجلب العناصر الجديدة من الـ DOM
+                    break
             
-            driver.execute_script("window.scrollBy(0, 1000);")
-            time.sleep(2)
+            # إذا لم نجد صوراً جديدة في هذه المحاولة، نقوم بعمل سكرول إجباري للأسفل
+            if not extracted_in_this_pass:
+                driver.execute_script("window.scrollBy(0, window.innerHeight);")
+                time.sleep(1.5)
+                empty_scrolls += 1
             
-            new_height = driver.execute_script("return document.documentElement.scrollHeight")
-            if new_height == last_height:
+            # إذا قمنا بالسكرول 6 مرات متتالية ولم نجد صوراً جديدة، فهذا يعني أننا وصلنا للنهاية
+            if empty_scrolls >= 6:
+                print(f"[INFO] Reached the end of the document. Total pages: {len(images_base64)}")
                 break
-            last_height = new_height
+                
             scroll_attempts += 1
 
         if not images_base64:
             return {"success": False, "error": "لم يتم العثور على أي محتوى مطابق."}
         
         pil_images = []
-        for b64 in images_base64:
+        for index, b64 in enumerate(images_base64):
             if "," in b64:
                 b64_string = b64.split(",")[1]
             else:
@@ -192,10 +212,8 @@ async def delete_file_after_delay(file_path: str, delay_seconds: int = 900):
 async def on_ready():
     print(f'Bot is ready. Logged in as {bot.user}')
     
-    # تشغيل خادم الويب بجانب البوت
     bot.loop.create_task(start_web_server())
 
-    # مزامنة السلاش كوماندز
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")
@@ -207,19 +225,16 @@ async def on_ready():
 async def fetch_pdf(interaction: discord.Interaction, url: str):
     
     await interaction.response.defer(ephemeral=False)
-    await interaction.edit_original_response(content="⏳ **جاري فحص المحتوى وسحب الصفحات... الرجاء الانتظار.**")
+    await interaction.edit_original_response(content="⏳ **جاري معالجة الملف...** *(قد يستغرق الملف المكون من 400 صفحة عدة دقائق، يرجى الانتظار)*")
     
-    # استخدام الـ id الخاص بالـ interaction لتسمية الملف
     output_filename = f"drive_doc_{interaction.id}.pdf"
     
-    # استخراج الملف وتحويله لـ PDF
     result = await asyncio.to_thread(extract_pdf_via_canvas, url, output_filename)
     
     if result["success"]:
         file_path = result["file_path"]
         filename = result["filename"]
         
-        # إنشاء رابط التحميل المباشر من هيروكو
         direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{filename}"
         
         await interaction.edit_original_response(content=(
@@ -228,13 +243,11 @@ async def fetch_pdf(interaction: discord.Interaction, url: str):
             f"⚠️ *ملاحظة: هذا الرابط سيعمل لمدة **15 دقيقة** فقط وسيتم حذف الملف تلقائياً لتوفير المساحة.*"
         ))
         
-        # جدولة حذف الملف بعد 15 دقيقة (900 ثانية)
         asyncio.create_task(delete_file_after_delay(file_path, 900))
         
     else:
         await interaction.edit_original_response(content=f"❌ **فشل استخراج الملف:** {result['error']}")
 
-# تشغيل البوت باستخدام التوكن من متغيرات البيئة
 if DISCORD_BOT_TOKEN:
     bot.run(DISCORD_BOT_TOKEN)
 else:
