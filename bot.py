@@ -1,11 +1,13 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
 import os
 import time
 import base64
 import re
 import shutil
+from typing import Literal
 from io import BytesIO
 from PIL import Image
 
@@ -77,7 +79,7 @@ def init_driver():
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_quality: float, img_sleep: float, scroll_sleep: float):
     driver = init_driver()
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
@@ -114,7 +116,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
         max_attempts = 2000
         empty_scrolls = 0
         
-        # نبدأ حساب الوقت الفعلي من لحظة بدء سحب الصور
         progress_state["start_time"] = time.time()
         
         while scroll_attempts < max_attempts:
@@ -128,10 +129,13 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
                     
                     if src and src.startswith(check_url_string) and src not in processed_urls:
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
-                        time.sleep(1) 
+                        # استخدام وقت الانتظار المخصص حسب اختيار المستخدم للسرعة
+                        time.sleep(img_sleep) 
                         
+                        # تمرير متغير الجودة المخصص (img_quality) للجافاسكريبت
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
+                            var quality = arguments[1];
                             if (img.naturalWidth === 0) return null;
                             
                             var canvasElement = document.createElement("canvas");
@@ -140,8 +144,8 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
                             canvasElement.height = img.naturalHeight;
                             
                             con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
-                            return canvasElement.toDataURL('image/jpeg', 0.9);
-                        """, img)
+                            return canvasElement.toDataURL('image/jpeg', quality);
+                        """, img, img_quality)
                         
                         if b64_data:
                             b64_string = b64_data.split(",")[1] if "," in b64_data else b64_data
@@ -166,7 +170,8 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
             
             if not extracted_in_this_pass:
                 driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                time.sleep(1.5)
+                # استخدام وقت التمرير المخصص حسب اختيار المستخدم
+                time.sleep(scroll_sleep)
                 empty_scrolls += 1
             
             if empty_scrolls >= 6:
@@ -236,14 +241,40 @@ def create_progress_bar(current, total, length=15):
     return f"[{bar}] {percent}%"
 
 @bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف وإعطاء رابط تحميل مباشر")
-@discord.app_commands.describe(
+@app_commands.describe(
     url="رابط جوجل درايف للملف",
-    expected_pages="عدد الصفحات (اختياري) للحصول على شريط تقدم ووقت مقدر دقيق"
+    expected_pages="عدد الصفحات (اختياري) للحصول على شريط تقدم ووقت مقدر دقيق",
+    quality="اختر جودة الصور المستخرجة",
+    speed="اختر سرعة عملية السحب"
 )
-async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: int = None):
-    
+async def fetch_pdf(
+    interaction: discord.Interaction, 
+    url: str, 
+    expected_pages: int = None,
+    quality: Literal["عالية (دقة ممتازة - حجم كبير)", "متوسطة (موصى به - متوازن)", "منخفضة (سريعة - حجم صغير)"] = "متوسطة (موصى به - متوازن)",
+    speed: Literal["ممتازة/بطيئة (تضمن عدم ضياع الصفحات)", "متوسطة (توازن بين الأمان والوقت)", "سريعة جداً (قد تفقد بعض الصفحات وتكون مشوشة)"] = "ممتازة/بطيئة (تضمن عدم ضياع الصفحات)"
+):
     await interaction.response.defer(ephemeral=False)
     
+    # --- ترجمة خيارات الجودة ---
+    if "عالية" in quality:
+        img_quality = 0.9
+    elif "منخفضة" in quality:
+        img_quality = 0.5
+    else:
+        img_quality = 0.7 # متوسطة
+        
+    # --- ترجمة خيارات السرعة ---
+    if "بطيئة" in speed:
+        img_sleep = 1.2
+        scroll_sleep = 1.5
+    elif "سريعة" in speed:
+        img_sleep = 0.3
+        scroll_sleep = 0.8
+    else:
+        img_sleep = 0.8 # متوسطة
+        scroll_sleep = 1.2
+
     progress_state = {
         "status": "تهيئة المتصفح...",
         "pages": 0,
@@ -253,9 +284,19 @@ async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: 
         "error": None
     }
     
+    # مسار خلفي لتشغيل السيلينيوم
     task = asyncio.create_task(
-        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state)
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_quality, img_sleep, scroll_sleep)
     )
+    
+    # 🌟 خدعة الـ 15 دقيقة: جلب كائن الرسالة الأصلية للتحكم بها عبر Bot API بدلاً من Webhook
+    original_response = await interaction.original_response()
+    try:
+        current_message = await interaction.channel.fetch_message(original_response.id)
+    except Exception:
+        current_message = original_response # كخطة بديلة
+        
+    message_creation_time = time.time()
     
     while not task.done():
         status_msg = progress_state["status"]
@@ -266,7 +307,7 @@ async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: 
         p_bar = create_progress_bar(current_pages, expected_pages)
         pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
         
-        # --- حساب الوقت المقدر (ETA) ---
+        # حساب الوقت المقدر
         eta_text = "جاري الحساب..."
         if start_time and current_pages > 0:
             elapsed_time = time.time() - start_time
@@ -285,21 +326,38 @@ async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: 
         elif not expected_pages:
             eta_text = "غير معروف (لم يتم إدخال إجمالي الصفحات)"
         
-        # إنشاء الـ Embed
+        # تصميم رسالة التحديث
         embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
         embed.add_field(name="الاسم الأصلي:", value=f"`{title}`", inline=False)
         embed.add_field(name="الحالة:", value=f"**{status_msg}**", inline=False)
         embed.add_field(name="التقدم:", value=f"`{p_bar}`", inline=False)
         embed.add_field(name="الصفحات المسحوبة:", value=f"`{pages_text}`", inline=True)
-        embed.add_field(name="الوقت المقدر للانتهاء (ETA):", value=f"`{eta_text}`", inline=True)
+        embed.add_field(name="الوقت المقدر (ETA):", value=f"`{eta_text}`", inline=True)
+        embed.set_footer(text=f"⚙️ الجودة: {quality.split(' ')[0]} | السرعة: {speed.split(' ')[0]}")
         
-        try:
-            await interaction.edit_original_response(content=None, embed=embed)
-        except Exception:
-            pass 
+        # 🌟 التحقق من انتهاء صلاحية رسالة الديسكورد (تتجدد كل 14 دقيقة)
+        time_elapsed_since_creation = time.time() - message_creation_time
+        if time_elapsed_since_creation >= 840: # 840 ثانية = 14 دقيقة
+            try:
+                # إرسال رسالة جديدة في نفس القناة
+                new_message = await interaction.channel.send(embed=embed)
+                # حذف الرسالة القديمة المنتهية
+                await current_message.delete()
+                # تعيين الرسالة الجديدة كالرسالة الحالية
+                current_message = new_message
+                message_creation_time = time.time()
+                print("[INFO] Message renewed to bypass 15-minute Discord limit.")
+            except Exception as e:
+                print(f"[ERROR] Failed to renew message: {e}")
+        else:
+            try:
+                await current_message.edit(embed=embed)
+            except Exception:
+                pass 
         
         await asyncio.sleep(5) 
     
+    # بعد انتهاء المهمة بالنجاح أو الفشل:
     result = await task
     
     if result.get("success"):
@@ -315,15 +373,15 @@ async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: 
             color=discord.Color.green()
         )
         final_embed.add_field(name="📥 رابط التحميل المباشر:", value=f"[اضغط هنا لتحميل الملف]({direct_link})\nأو انسخ الرابط:\n`{direct_link}`", inline=False)
-        final_embed.set_footer(text="⚠️ سيتم حذف هذا الرابط والملف تلقائياً بعد 15 دقيقة.")
+        final_embed.set_footer(text="⚠️ سيتم حذف هذا الرابط والملف تلقائياً بعد 15 دقيقة لتوفير مساحة السيرفر.")
         
-        await interaction.edit_original_response(embed=final_embed)
+        await current_message.edit(embed=final_embed)
         
         asyncio.create_task(delete_file_after_delay(file_path, 900))
         
     else:
         err_embed = discord.Embed(title="❌ فشل العملية", description=result.get('error'), color=discord.Color.red())
-        await interaction.edit_original_response(embed=err_embed)
+        await current_message.edit(embed=err_embed)
 
 if DISCORD_BOT_TOKEN:
     bot.run(DISCORD_BOT_TOKEN)
