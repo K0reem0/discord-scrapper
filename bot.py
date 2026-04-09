@@ -159,45 +159,60 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 @bot.event
 async def on_ready():
     print(f'Bot is ready. Logged in as {bot.user}')
+    # مزامنة السلاش كوماندز مع سيرفرات الديسكورد
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash commands.")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
 
-@bot.command(name="fetchpdf")
-async def fetch_pdf(ctx, url: str):
-    """أمر لاستخراج ملف درايف وإعطاء رابط تحميل مباشر"""
-    msg = await ctx.send("⏳ **جاري فحص المحتوى وسحب الصفحات... الرجاء الانتظار.**")
+@bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف وإعطاء رابط تحميل مباشر")
+@discord.app_commands.describe(url="رابط جوجل درايف للملف")
+async def fetch_pdf(interaction: discord.Interaction, url: str):
+    """سلاش كوماند لاستخراج ملف درايف وإعطاء رابط تحميل مباشر"""
     
-    output_filename = f"drive_doc_{ctx.message.id}.pdf"
+    # يجب استخدام defer لأن العملية تطول أكثر من 3 ثوانٍ
+    await interaction.response.defer(ephemeral=False)
+    
+    await interaction.edit_original_response(content="⏳ **جاري فحص المحتوى وسحب الصفحات... الرجاء الانتظار.**")
+    
+    # استخدام الـ id الخاص بالـ interaction لتسمية الملف
+    output_filename = f"drive_doc_{interaction.id}.pdf"
     
     # 1. استخراج الملف وتحويله لـ PDF
     result = await asyncio.to_thread(extract_pdf_via_canvas, url, output_filename)
     
     if result["success"]:
         file_path = result["file_path"]
-        await msg.edit(content="⏳ **تم تجميع الملف بنجاح! جاري رفعه لإنشاء رابط تحميل مباشر...**")
+        await interaction.edit_original_response(content="⏳ **تم تجميع الملف بنجاح! جاري رفعه لإنشاء رابط تحميل مباشر...**")
         
         # 2. رفع الملف للحصول على الرابط المباشر
         direct_link = await upload_for_direct_link(file_path)
         
         if direct_link:
-            await msg.edit(content=f"✅ **اكتملت العملية بنجاح!**\n\n📥 **رابط التحميل المباشر:**\n{direct_link}")
+            await interaction.edit_original_response(content=f"✅ **اكتملت العملية بنجاح!**\n\n📥 **رابط التحميل المباشر:**\n{direct_link}")
         else:
             # كخيار بديل، إذا فشل الرفع وكان حجمه أقل من 25 ميجا سيرسله بالديسكورد
             file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
             if file_size_mb <= 25:
-                await msg.edit(content="⚠️ **فشل إنشاء رابط التحميل، لكن سأرسل الملف هنا مباشرة:**")
-                await ctx.send(file=discord.File(file_path))
+                await interaction.edit_original_response(
+                    content="⚠️ **فشل إنشاء رابط التحميل، لكن سأرسل الملف هنا مباشرة:**",
+                    attachments=[discord.File(file_path)]
+                )
             else:
-                await msg.edit(content="❌ **فشل إنشاء الرابط وحجم الملف كبير جداً لإرساله في ديسكورد مباشرة.**")
+                await interaction.edit_original_response(content="❌ **فشل إنشاء الرابط وحجم الملف كبير جداً لإرساله في ديسكورد مباشرة.**")
                 
         # 3. حذف الملف من السيرفر لتوفير المساحة
         if os.path.exists(file_path):
             os.remove(file_path)
     else:
-        await msg.edit(content=f"❌ **فشل استخراج الملف:** {result['error']}")
+        await interaction.edit_original_response(content=f"❌ **فشل استخراج الملف:** {result['error']}")
 
 # تشغيل البوت باستخدام التوكن من متغيرات البيئة
 if DISCORD_BOT_TOKEN:
