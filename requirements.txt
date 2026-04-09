@@ -5,3 +5,4 @@ pillow
 dropbox
 selenium
 webdriver-manager
+reportlab
