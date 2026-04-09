@@ -9,15 +9,20 @@ import re
 import shutil
 import gc
 import urllib.parse
+import json
 from typing import Literal
-from io import BytesIO
-from PIL import Image, JpegImagePlugin
+from PIL import Image
 
-# المكتبة السحرية الجديدة لتجميع الـ PDF بدون استهلاك رام
+# مكتبة تجميع الـ PDF بدون استهلاك رام
 from reportlab.pdfgen import canvas
 
-# استيرادات خادم الويب
+# مكتبات قاعدة البيانات وجوجل
+import asyncpg
 from aiohttp import web
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 # استيرادات Selenium
 from selenium import webdriver
@@ -30,18 +35,83 @@ from selenium.common.exceptions import WebDriverException, StaleElementReference
 # --- الإعدادات ---
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 HEROKU_BASE_URL = "https://discord-scrap-f0a38eba4b1c.herokuapp.com" 
+DATABASE_URL = os.getenv("DATABASE_URL")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+
+# إعدادات جوجل درايف
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+# إعدادات الـ OAuth
+if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
+    client_config = {
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [f"{HEROKU_BASE_URL}/auth/google/callback"]
+        }
+    }
+else:
+    client_config = None
 
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-
-# قاموس لتتبع أوقات حذف الملفات (لتمديد الوقت)
 expiration_times = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- إعدادات خادم الويب ---
+db_pool = None
+
+# --- إعدادات قاعدة البيانات ---
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        print("[WARNING] DATABASE_URL not found. Database features will be disabled.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, ssl="require")
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_tokens (
+                    discord_id BIGINT PRIMARY KEY,
+                    token TEXT,
+                    refresh_token TEXT,
+                    token_uri TEXT,
+                    client_id TEXT,
+                    client_secret TEXT,
+                    scopes TEXT
+                )
+            """)
+        print("[INFO] Database connected and table verified.")
+    except Exception as e:
+        print(f"[ERROR] Database connection failed: {e}")
+
+# --- دوال جوجل درايف ---
+def get_user_credentials(token_data):
+    return Credentials(
+        token=token_data['token'],
+        refresh_token=token_data['refresh_token'],
+        token_uri=token_data['token_uri'],
+        client_id=token_data['client_id'],
+        client_secret=token_data['client_secret'],
+        scopes=json.loads(token_data['scopes'])
+    )
+
+def upload_to_drive_sync(creds, file_path, filename):
+    try:
+        service = build('drive', 'v3', credentials=creds)
+        file_metadata = {'name': filename}
+        media = MediaFileUpload(file_path, mimetype='application/pdf', resumable=True)
+        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        return {"success": True, "link": file.get('webViewLink')}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+# --- إعدادات خادم الويب (مسارات الملفات وتسجيل الدخول) ---
 async def download_file_handler(request):
     folder_id = request.match_info.get('folder_id')
     filename = request.match_info.get('filename')
@@ -52,17 +122,73 @@ async def download_file_handler(request):
     if not os.path.exists(file_path):
         return web.Response(status=404, text="❌ الملف غير موجود أو تم حذفه لانتهاء صلاحيته.")
     
-    return web.FileResponse(file_path, headers={
-        'Content-Disposition': f'attachment; filename="{decoded_filename}"'
-    })
+    return web.FileResponse(file_path, headers={'Content-Disposition': f'attachment; filename="{decoded_filename}"'})
+
+async def auth_login_handler(request):
+    discord_id = request.match_info.get('discord_id')
+    if not client_config:
+        return web.Response(text="❌ Google OAuth is not configured on the server.")
+    
+    flow = Flow.from_client_config(client_config, scopes=SCOPES)
+    flow.redirect_uri = f"{HEROKU_BASE_URL}/auth/google/callback"
+    
+    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline', state=discord_id)
+    return web.HTTPFound(auth_url)
+
+async def auth_callback_handler(request):
+    state = request.query.get('state')
+    code = request.query.get('code')
+    
+    if not state or not code:
+        return web.Response(text="❌ فشل تسجيل الدخول: بيانات مفقودة.", status=400)
+    
+    try:
+        flow = Flow.from_client_config(client_config, scopes=SCOPES)
+        flow.redirect_uri = f"{HEROKU_BASE_URL}/auth/google/callback"
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        
+        discord_id = int(state)
+        scopes_json = json.dumps(creds.scopes)
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO user_tokens (discord_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (discord_id) DO UPDATE SET
+                    token = EXCLUDED.token,
+                    refresh_token = COALESCE(EXCLUDED.refresh_token, user_tokens.refresh_token),
+                    token_uri = EXCLUDED.token_uri,
+                    client_id = EXCLUDED.client_id,
+                    client_secret = EXCLUDED.client_secret,
+                    scopes = EXCLUDED.scopes
+            """, discord_id, creds.token, creds.refresh_token, creds.token_uri, creds.client_id, creds.client_secret, scopes_json)
+            
+        success_html = """
+        <html>
+            <head><title>Success</title><meta charset="utf-8"></head>
+            <body style="display:flex; justify-content:center; align-items:center; height:100vh; background-color:#2f3136; color:white; font-family:sans-serif; text-align:center;">
+                <div>
+                    <h1 style="color:#43b581;">✅ تم التسجيل بنجاح!</h1>
+                    <p>تم ربط حساب جوجل درايف بحساب الديسكورد الخاص بك.</p>
+                    <p>يمكنك إغلاق هذه الصفحة والعودة للديسكورد الآن.</p>
+                </div>
+            </body>
+        </html>
+        """
+        return web.Response(text=success_html, content_type="text/html; charset=utf-8")
+    except Exception as e:
+        return web.Response(text=f"❌ حدث خطأ أثناء ربط الحساب: {e}", content_type="text/html; charset=utf-8")
 
 async def health_check_handler(request):
-    return web.Response(text="✅ خادم الملفات يعمل بنجاح!")
+    return web.Response(text="✅ خادم الملفات ونظام التسجيل يعمل بنجاح!")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', health_check_handler)
     app.router.add_get(f'/{DOWNLOADS_DIR}/{{folder_id}}/{{filename}}', download_file_handler)
+    app.router.add_get('/auth/login/{discord_id}', auth_login_handler)
+    app.router.add_get('/auth/google/callback', auth_callback_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()
@@ -91,7 +217,7 @@ async def background_cleanup_task(file_path):
             break
         await asyncio.sleep(30)
 
-# --- كلاس الأزرار (View) ---
+# --- كلاس الأزرار ---
 class FileManagementView(ui.View):
     def __init__(self, file_path, download_url, display_name):
         super().__init__(timeout=None)
@@ -122,7 +248,8 @@ class FileManagementView(ui.View):
                 folder_path = os.path.dirname(self.file_path)
                 if os.path.exists(folder_path) and not os.listdir(folder_path):
                     os.rmdir(folder_path)
-            except Exception: pass
+            except Exception: 
+                pass
             
             expiration_times.pop(self.file_path, None)
             
@@ -135,7 +262,7 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ الملف غير موجود بالفعل.", ephemeral=True)
 
-# --- إعدادات Selenium ---
+# --- إعدادات سيلينيوم والاستخراج ---
 def init_driver(scale_factor: float, window_size: str):
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -143,7 +270,6 @@ def init_driver(scale_factor: float, window_size: str):
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     
-    # تحديد الأبعاد وكثافة البكسلات لإجبار درايف على أعلى دقة
     chrome_options.add_argument(f"--window-size={window_size}")
     chrome_options.add_argument(f"--force-device-scale-factor={scale_factor}") 
     chrome_options.add_argument("--high-dpi-support=1")
@@ -186,8 +312,11 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
         
         raw_title = driver.title.replace(" - Google Drive", "").strip()
         clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
-        if not clean_title: clean_title = f"drive_doc_{output_id}"
-        if not clean_title.lower().endswith(".pdf"): clean_title += ".pdf"
+        
+        if not clean_title:
+            clean_title = f"drive_doc_{output_id}"
+        if not clean_title.lower().endswith(".pdf"):
+            clean_title += ".pdf"
             
         progress_state["title"] = clean_title
         progress_state["status"] = "جاري سحب الصفحات..."
@@ -210,7 +339,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
                         time.sleep(img_sleep) 
                         
-                        # كود السحب مع تمرير الحد الأقصى للأبعاد (max_dim)
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
                             var format = arguments[1];
@@ -222,7 +350,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                             var w = img.naturalWidth;
                             var h = img.naturalHeight;
                             
-                            // حاجز الأمان: يحد من الأبعاد فقط إذا تجاوزت max_limit
                             if (w > max_limit || h > max_limit) {
                                 var ratio = Math.min(max_limit / w, max_limit / h);
                                 w = Math.round(w * ratio);
@@ -291,7 +418,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
         
         pdf_path = os.path.join(user_dir, clean_title)
         
-        # بناء الـ PDF باستخدام ReportLab
         c = canvas.Canvas(pdf_path)
         for img_path in saved_images_paths:
             try:
@@ -307,18 +433,27 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                 
         c.save() 
         
-        return {"success": True, "file_path": pdf_path, "filename": clean_title, "folder_id": output_id}
+        return {
+            "success": True, 
+            "file_path": pdf_path, 
+            "filename": clean_title, 
+            "folder_id": output_id,
+            "display_name": clean_title
+        }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
         progress_state["done"] = True
-        if driver: driver.quit()
-        if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
+        if driver:
+            driver.quit()
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 @bot.event
 async def on_ready():
     print(f'Bot is ready. Logged in as {bot.user}')
+    await init_db()
     bot.loop.create_task(start_web_server())
     try:
         await bot.tree.sync()
@@ -334,30 +469,78 @@ def create_progress_bar(current, total, length=15):
     bar = '█' * filled_length + '░' * (length - filled_length)
     return f"[{bar}] {percent}%"
 
-@bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف وإعطاء رابط تحميل مباشر")
+# --- أوامر تسجيل الدخول والخروج ---
+@bot.tree.command(name="login", description="تسجيل الدخول لحساب جوجل لرفع الملفات مباشرة للدرايف")
+async def login_command(interaction: discord.Interaction):
+    if not GOOGLE_CLIENT_ID:
+        return await interaction.response.send_message("❌ ميزة الرفع السحابي غير مفعلة في السيرفر حالياً. (Client ID مفقود)", ephemeral=True)
+    
+    login_url = f"{HEROKU_BASE_URL}/auth/login/{interaction.user.id}"
+    
+    embed = discord.Embed(
+        title="🔐 تسجيل الدخول لجوجل درايف", 
+        description="اضغط على الزر أدناه لتسجيل الدخول بأمان وتخويل البوت برفع الملفات لحسابك.", 
+        color=discord.Color.blue()
+    )
+    
+    view = ui.View()
+    view.add_item(ui.Button(label="تسجيل الدخول هنا", url=login_url, style=discord.ButtonStyle.link))
+    
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+@bot.tree.command(name="logout", description="تسجيل الخروج وحذف بيانات ربط جوجل من البوت")
+async def logout_command(interaction: discord.Interaction):
+    if not db_pool:
+        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة.", ephemeral=True)
+    
+    async with db_pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM user_tokens WHERE discord_id = $1", interaction.user.id)
+        
+        if result == "DELETE 1":
+            await interaction.response.send_message("✅ تم تسجيل الخروج بنجاح. تم حذف جميع مفاتيح الربط الخاصة بك من السيرفر.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ حسابك غير مربوط بجوجل أساساً.", ephemeral=True)
+
+# --- أمر السلاش الرئيسي ---
+@bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف")
 @app_commands.describe(
     url="رابط جوجل درايف للملف",
     expected_pages="عدد الصفحات (اختياري) للحصول على شريط تقدم ووقت مقدر دقيق",
     quality="اختر جودة الصور المستخرجة",
-    speed="اختر سرعة عملية السحب"
+    speed="اختر سرعة عملية السحب",
+    save_to_drive="هل ترغب برفع الملف مباشرة لحسابك في درايف؟ (يجب استخدام أمر /login أولاً)"
 )
 async def fetch_pdf(
     interaction: discord.Interaction, 
     url: str, 
     expected_pages: int = None,
     quality: Literal["عالية (دقة ممتازة - حجم كبير)", "متوسطة (موصى به - متوازن)", "منخفضة (سريعة - حجم صغير)"] = "متوسطة (موصى به - متوازن)",
-    speed: Literal["ممتازة/بطيئة (تضمن عدم ضياع الصفحات)", "متوسطة (توازن بين الأمان والوقت)", "سريعة جداً (قد تفقد بعض الصفحات وتكون مشوشة)"] = "ممتازة/بطيئة (تضمن عدم ضياع الصفحات)"
+    speed: Literal["ممتازة/بطيئة (تضمن عدم ضياع الصفحات)", "متوسطة (توازن بين الأمان والوقت)", "سريعة جداً (قد تفقد بعض الصفحات وتكون مشوشة)"] = "ممتازة/بطيئة (تضمن عدم ضياع الصفحات)",
+    save_to_drive: bool = False
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # 🔥 إعدادات الجودة الجديدة (تم كسر حاجز الأمان للجودة العالية لتصبح فائقة الدقة)
+    # 🌟 التحقق من وجود بيانات المستخدم في الداتا بيز إذا طلب الرفع للدرايف
+    user_creds_data = None
+    if save_to_drive:
+        if not db_pool:
+            return await interaction.edit_original_response(content="❌ عذراً، ميزة الرفع السحابي معطلة حالياً بسبب مشكلة في قاعدة البيانات.")
+        
+        async with db_pool.acquire() as conn:
+            user_creds_data = await conn.fetchrow("SELECT * FROM user_tokens WHERE discord_id = $1", interaction.user.id)
+            
+        if not user_creds_data:
+            return await interaction.edit_original_response(content="❌ **يجب عليك تسجيل الدخول أولاً!** الرجاء استخدام أمر `/login` لربط حسابك بجوجل، ثم أعد المحاولة.")
+
+    # تحديد الجودة
     if "عالية" in quality:
         img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 3.0, "2560,1440", 8000
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 1.0, "800,1200", 2000
+        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 0.5, "jpg", 1.0, "800,1200", 2000
     else:
-        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 1.5, "1200,1600", 4000
+        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 0.8, "jpg", 1.5, "1200,1600", 4000
         
+    # تحديد السرعة
     if "بطيئة" in speed:
         img_sleep, scroll_sleep = 1.2, 1.5
     elif "سريعة" in speed:
@@ -448,36 +631,64 @@ async def fetch_pdf(
         file_path = result["file_path"]
         filename = result["filename"]
         folder_id = result["folder_id"]
+        display_name = result["display_name"]
         
         file_size_bytes = os.path.getsize(file_path)
         file_size_mb = file_size_bytes / (1024 * 1024)
         
-        encoded_filename = urllib.parse.quote(filename)
-        direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
-        
-        expiration_times[file_path] = time.time() + 900 
-        
         final_embed = discord.Embed(
-            title="✅ تم تجهيز الملف بنجاح!", 
-            description=f"تم استخراج جميع الصفحات لملف **{filename}**.",
+            title="✅ اكتملت المعالجة!", 
+            description=f"تم استخراج جميع الصفحات لملف **{display_name}**.",
             color=discord.Color.green()
         )
         final_embed.add_field(name="حجم الملف:", value=f"`{file_size_mb:.2f} MB`", inline=True)
         final_embed.add_field(name="عدد الصفحات:", value=f"`{progress_state['pages']}`", inline=True)
         final_embed.add_field(name="\u200B", value="\u200B", inline=True)
         
-        final_embed.add_field(
-            name="💡 معلومة مفيدة:", 
-            value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية لتأخير الحذف التلقائي.", 
-            inline=False
-        )
-        final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً بعد 15 دقيقة في حال عدم تمديد الوقت.")
+        upload_result = {}
         
-        view = FileManagementView(file_path, direct_link, filename)
-        await current_message.edit(embed=final_embed, view=view)
-        
-        asyncio.create_task(background_cleanup_task(file_path))
-        
+        # 🌟 مرحلة الرفع لدرايف إذا طلب المستخدم ذلك وكان مسجلاً
+        if save_to_drive and user_creds_data:
+            uploading_embed = discord.Embed(title="☁️ جاري الرفع لجوجل درايف...", color=discord.Color.gold())
+            await current_message.edit(embed=uploading_embed)
+            
+            try:
+                creds = get_user_credentials(user_creds_data)
+                upload_result = await asyncio.to_thread(upload_to_drive_sync, creds, file_path, display_name)
+                
+                if upload_result.get("success"):
+                    final_embed.add_field(name="☁️ تم الرفع لحسابك بنجاح!", value=f"[اضغط هنا لفتح الملف في جوجل درايف الخاص بك]({upload_result['link']})", inline=False)
+                    final_embed.set_footer(text="تم الحفظ بنجاح في حساب جوجل درايف المربوط.")
+                    
+                    # حذف الملف من السيرفر فوراً لتوفير المساحة بما أنه رُفع بنجاح
+                    expiration_times[file_path] = time.time() + 5 
+                    asyncio.create_task(background_cleanup_task(file_path))
+                    
+                    await current_message.edit(embed=final_embed, view=None)
+                else:
+                    final_embed.add_field(name="⚠️ فشل الرفع للدرايف (قد يكون المساحة ممتلئة):", value=f"```\n{upload_result['error']}\n```", inline=False)
+            except Exception as e:
+                final_embed.add_field(name="⚠️ حدث خطأ غير متوقع أثناء الرفع:", value=str(e), inline=False)
+
+        # 🌟 إذا لم يطلب الرفع، أو إذا فشل الرفع لأي سبب، نعطيه رابط التحميل المباشر من هيروكو
+        if not save_to_drive or not upload_result.get("success"):
+            encoded_filename = urllib.parse.quote(filename)
+            direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
+            
+            expiration_times[file_path] = time.time() + 900 
+            
+            final_embed.add_field(
+                name="💡 معلومة مفيدة:", 
+                value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية لتأخير الحذف التلقائي.", 
+                inline=False
+            )
+            final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً من سيرفر البوت بعد 15 دقيقة في حال عدم تمديد الوقت.")
+            
+            view = FileManagementView(file_path, direct_link, display_name)
+            await current_message.edit(embed=final_embed, view=view)
+            
+            asyncio.create_task(background_cleanup_task(file_path))
+            
     else:
         err_embed = discord.Embed(title="❌ فشل العملية", description=result.get('error'), color=discord.Color.red())
         await current_message.edit(embed=err_embed)
