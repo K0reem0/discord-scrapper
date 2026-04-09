@@ -13,7 +13,7 @@ from typing import Literal
 from io import BytesIO
 from PIL import Image, JpegImagePlugin
 
-# المكتبة السحرية الجديدة لتجميع الـ PDF بدون رام
+# المكتبة السحرية الجديدة لتجميع الـ PDF بدون استهلاك رام
 from reportlab.pdfgen import canvas
 
 # استيرادات خادم الويب
@@ -135,7 +135,7 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ الملف غير موجود بالفعل.", ephemeral=True)
 
-# --- إعدادات Selenium (تغيير ذكي للأبعاد حسب الجودة) ---
+# --- إعدادات Selenium ---
 def init_driver(scale_factor: float, window_size: str):
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -143,7 +143,7 @@ def init_driver(scale_factor: float, window_size: str):
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     
-    # تحديد أبعاد الشاشة بناءً على الجودة لمنع انهيار الرام
+    # تحديد الأبعاد وكثافة البكسلات لإجبار درايف على أعلى دقة
     chrome_options.add_argument(f"--window-size={window_size}")
     chrome_options.add_argument(f"--force-device-scale-factor={scale_factor}") 
     chrome_options.add_argument("--high-dpi-support=1")
@@ -162,7 +162,7 @@ def init_driver(scale_factor: float, window_size: str):
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, scale_factor: float, window_size: str, img_sleep: float, scroll_sleep: float):
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, scale_factor: float, window_size: str, max_dim: int, img_sleep: float, scroll_sleep: float):
     driver = init_driver(scale_factor, window_size)
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
@@ -210,20 +210,21 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
                         time.sleep(img_sleep) 
                         
-                        # كود استخراج محسّن لحماية الرام من الصور الضخمة جداً
+                        # كود السحب مع تمرير الحد الأقصى للأبعاد (max_dim)
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
                             var format = arguments[1];
                             var quality = arguments[2];
+                            var max_limit = arguments[3];
+                            
                             if (img.naturalWidth === 0) return null;
                             
                             var w = img.naturalWidth;
                             var h = img.naturalHeight;
                             
-                            // تحجيم الصور الفائقة الضخامة لحماية المتصفح من الانهيار
-                            var max_dim = 4000;
-                            if (w > max_dim || h > max_dim) {
-                                var ratio = Math.min(max_dim / w, max_dim / h);
+                            // حاجز الأمان: يحد من الأبعاد فقط إذا تجاوزت max_limit
+                            if (w > max_limit || h > max_limit) {
+                                var ratio = Math.min(max_limit / w, max_limit / h);
                                 w = Math.round(w * ratio);
                                 h = Math.round(h * ratio);
                             }
@@ -233,7 +234,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                             canvasElement.width = w;
                             canvasElement.height = h;
                             
-                            // إضافة خلفية بيضاء لتفادي مشاكل الشفافية
                             con.fillStyle = "#FFFFFF";
                             con.fillRect(0, 0, w, h);
                             con.drawImage(img, 0, 0, w, h);
@@ -246,7 +246,7 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                             canvasElement = null;
                             
                             return data;
-                        """, img, img_format, img_quality)
+                        """, img, img_format, img_quality, max_dim)
                         
                         if b64_data:
                             b64_string = b64_data.split(",")[1] if "," in b64_data else b64_data
@@ -289,27 +289,23 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
         progress_state["extracting"] = False 
         progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF (بدون استهلاك للذاكرة)..."
         
-        # حفظ الـ PDF داخل مجلد المستخدم
         pdf_path = os.path.join(user_dir, clean_title)
         
-        # 🔥 هنا السر الجديد: استخدام ReportLab لتجميع الـ PDF لضمان عدم استهلاك الرام أبداً
+        # بناء الـ PDF باستخدام ReportLab
         c = canvas.Canvas(pdf_path)
         for img_path in saved_images_paths:
             try:
                 with Image.open(img_path) as img:
                     w, h = img.size
                 
-                # إعداد مقاس الصفحة ليكون مطابقاً للصورة تماماً
                 c.setPageSize((w, h))
-                # رسم الصورة في الإحداثيات 0,0 
                 c.drawImage(img_path, 0, 0, width=w, height=h)
-                # إنهاء الصفحة وإرسالها للقرص الصلب مباشرة (تفريغ الرام)
                 c.showPage()
                 gc.collect()
             except Exception as e:
                 print(f"[WARNING] Skipping corrupted image {img_path}: {e}")
                 
-        c.save() # حفظ الملف النهائي
+        c.save() 
         
         return {"success": True, "file_path": pdf_path, "filename": clean_title, "folder_id": output_id}
 
@@ -354,13 +350,13 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # تحديد الجودة وكثافة البكسلات وحجم الشاشة لمنع انهيار هيروكو
+    # 🔥 إعدادات الجودة الجديدة (تم كسر حاجز الأمان للجودة العالية لتصبح فائقة الدقة)
     if "عالية" in quality:
-        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 1.0, "jpg", 2.0, "1200,1600"
+        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 3.0, "2560,1440", 8000
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 0.5, "jpg", 1.0, "800,1200"
+        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 1.0, "800,1200", 2000
     else:
-        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 0.8, "jpg", 1.5, "1000,1400"
+        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 1.5, "1200,1600", 4000
         
     if "بطيئة" in speed:
         img_sleep, scroll_sleep = 1.2, 1.5
@@ -380,7 +376,7 @@ async def fetch_pdf(
     }
     
     task = asyncio.create_task(
-        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, scale_factor, window_size, img_sleep, scroll_sleep)
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, scale_factor, window_size, max_dim, img_sleep, scroll_sleep)
     )
     
     original_response = await interaction.original_response()
