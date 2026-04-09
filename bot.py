@@ -27,38 +27,32 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 def init_driver():
     """
-    تهيئة متصفح Chrome في وضع Headless.
+    تهيئة متصفح Chrome في وضع Headless (Heroku - chrome-for-testing)
     """
-    chrome_bin = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_BIN")
-    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
-    
-    if not chrome_bin or not chromedriver_path:
-        print("[CRITICAL ERROR] Heroku environment variables (CHROME_BIN/CHROMEDRIVER_PATH) not found.")
-        return None
-
     chrome_options = Options()
-    
-    # خيارات أساسية لـ Headless
-    chrome_options.add_argument("--headless")
+
+    # مهم جدًا لـ Heroku
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    # استراتيجية تحميل الصفحة
-    chrome_options.page_load_strategy = 'eager'
-    
-    chrome_options.binary_location = chrome_bin 
+
+    # يخلي Selenium يلقاه تلقائي
+    chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN")
 
     try:
-        service = Service(executable_path=chromedriver_path)
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        # ❗ بدون Service ولا executable_path
+        driver = webdriver.Chrome(options=chrome_options)
+
         driver.set_page_load_timeout(60)
-        print("[INFO] Chrome Driver initialized successfully using Heroku static paths and Service object.")
+        print("[INFO] Chrome Driver initialized successfully (chrome-for-testing).")
         return driver
+
     except WebDriverException as e:
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {type(e).__name__} - {e}")
         return None
-
+        
 async def upload_for_direct_link(file_path):
     """
     دالة لرفع الملف إلى خدمة Catbox المجانية والحصول على رابط تحميل مباشر.
