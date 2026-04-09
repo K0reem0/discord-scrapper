@@ -13,7 +13,7 @@ import json
 from typing import Literal
 from PIL import Image
 
-# مكتبة تجميع الـ PDF بدون استهلاك رام
+# مكتبة تجميع الـ PDF
 from reportlab.pdfgen import canvas
 
 # مكتبات قاعدة البيانات وجوجل
@@ -39,8 +39,12 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
-# إعدادات جوجل درايف
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
+# إعدادات جوجل درايف 
+SCOPES = [
+    'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/userinfo.email',
+    'openid'
+]
 
 if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
     client_config = {
@@ -57,10 +61,11 @@ else:
 
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-expiration_times = {}
 
-# قاموس لحفظ مفاتيح التحقق المؤقتة لجوجل (PKCE)
+# قواميس التتبع السحابية
+expiration_times = {}
 auth_sessions = {}
+pending_logins = {} # لحفظ رسالة الديسكورد وتحديثها لاحقاً
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -85,9 +90,27 @@ async def init_db():
                     token_uri TEXT,
                     client_id TEXT,
                     client_secret TEXT,
-                    scopes TEXT
+                    scopes TEXT,
+                    google_email TEXT,
+                    files_extracted INTEGER DEFAULT 0,
+                    files_uploaded INTEGER DEFAULT 0
                 )
             """)
+            
+            # تحديث الجدول إذا كان قديماً
+            try:
+                await conn.execute("ALTER TABLE user_tokens ADD COLUMN google_email TEXT")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE user_tokens ADD COLUMN files_extracted INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                await conn.execute("ALTER TABLE user_tokens ADD COLUMN files_uploaded INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            
         print("[INFO] Database connected and table verified.")
     except Exception as e:
         print(f"[ERROR] Database connection failed: {e}")
@@ -136,7 +159,6 @@ async def auth_login_handler(request):
     
     auth_url, state = flow.authorization_url(prompt='consent', access_type='offline', state=discord_id)
     
-    # حفظ كود التحقق الأمني المؤقت
     if hasattr(flow, 'code_verifier'):
         auth_sessions[state] = flow.code_verifier
         
@@ -153,29 +175,46 @@ async def auth_callback_handler(request):
         flow = Flow.from_client_config(client_config, scopes=SCOPES)
         flow.redirect_uri = f"{HEROKU_BASE_URL}/auth/google/callback"
         
-        # استعادة كود التحقق الأمني
         if state in auth_sessions:
             flow.code_verifier = auth_sessions.pop(state)
             
         flow.fetch_token(code=code)
         creds = flow.credentials
         
+        oauth2_service = build('oauth2', 'v2', credentials=creds)
+        user_info = oauth2_service.userinfo().get().execute()
+        google_email = user_info.get('email', 'غير معروف')
+        
         discord_id = int(state)
         scopes_json = json.dumps(creds.scopes)
         
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO user_tokens (discord_id, token, refresh_token, token_uri, client_id, client_secret, scopes)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO user_tokens (discord_id, token, refresh_token, token_uri, client_id, client_secret, scopes, google_email)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (discord_id) DO UPDATE SET
                     token = EXCLUDED.token,
                     refresh_token = COALESCE(EXCLUDED.refresh_token, user_tokens.refresh_token),
                     token_uri = EXCLUDED.token_uri,
                     client_id = EXCLUDED.client_id,
                     client_secret = EXCLUDED.client_secret,
-                    scopes = EXCLUDED.scopes
-            """, discord_id, creds.token, creds.refresh_token, creds.token_uri, creds.client_id, creds.client_secret, scopes_json)
+                    scopes = EXCLUDED.scopes,
+                    google_email = EXCLUDED.google_email
+            """, discord_id, creds.token, creds.refresh_token, creds.token_uri, creds.client_id, creds.client_secret, scopes_json, google_email)
             
+        # تحديث رسالة الديسكورد الأصلية لتقول "تم تسجيل الدخول"
+        interaction = pending_logins.pop(discord_id, None)
+        if interaction:
+            try:
+                success_embed = discord.Embed(
+                    title="✅ تم تسجيل الدخول بنجاح!", 
+                    description=f"تم ربط حساب جوجل (`{google_email}`) بحسابك في ديسكورد.\nيمكنك الآن استخدام البوت لرفع الملفات مباشرة، أو استخدم أمر `/profile` لعرض ملفك.", 
+                    color=discord.Color.green()
+                )
+                await interaction.edit_original_response(embed=success_embed, view=None)
+            except Exception as e:
+                print(f"[WARNING] Could not update discord message: {e}")
+
         success_html = """
         <html>
             <head><title>Success</title><meta charset="utf-8"></head>
@@ -223,8 +262,8 @@ async def background_cleanup_task(file_path):
                     folder_path = os.path.dirname(file_path)
                     if os.path.exists(folder_path) and not os.listdir(folder_path):
                         os.rmdir(folder_path)
-                except Exception as e:
-                    print(f"[ERROR] فشل مسح الملف/المجلد: {e}")
+                except Exception:
+                    pass
             expiration_times.pop(file_path, None)
             break
         await asyncio.sleep(30)
@@ -305,7 +344,7 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
         return {"success": False, "error": progress_state["error"]}
-
+    
     processed_urls = set()
     saved_images_paths = []
     
@@ -327,6 +366,7 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
         
         if not clean_title:
             clean_title = f"drive_doc_{output_id}"
+            
         if not clean_title.lower().endswith(".pdf"):
             clean_title += ".pdf"
             
@@ -416,9 +456,10 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                 driver.execute_script("window.gc && window.gc();") 
             else:
                 empty_scrolls = 0
-                
+            
             if empty_scrolls >= 6:
                 break
+                
             scroll_attempts += 1
 
         if not saved_images_paths:
@@ -441,7 +482,7 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                 c.showPage()
                 gc.collect()
             except Exception as e:
-                print(f"[WARNING] Skipping corrupted image {img_path}: {e}")
+                print(f"[WARNING] Skipping image: {e}")
                 
         c.save() 
         
@@ -449,7 +490,7 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
             "success": True, 
             "file_path": pdf_path, 
             "filename": clean_title, 
-            "folder_id": output_id,
+            "folder_id": output_id, 
             "display_name": clean_title
         }
 
@@ -481,11 +522,16 @@ def create_progress_bar(current, total, length=15):
     bar = '█' * filled_length + '░' * (length - filled_length)
     return f"[{bar}] {percent}%"
 
-# --- أوامر تسجيل الدخول والخروج ---
+# --- أوامر تسجيل الدخول، الخروج، والملف الشخصي ---
+
 @bot.tree.command(name="login", description="تسجيل الدخول لحساب جوجل لرفع الملفات مباشرة للدرايف")
 async def login_command(interaction: discord.Interaction):
     if not GOOGLE_CLIENT_ID:
-        return await interaction.response.send_message("❌ ميزة الرفع السحابي غير مفعلة في السيرفر حالياً. (Client ID مفقود)", ephemeral=True)
+        await interaction.response.send_message("❌ ميزة الرفع السحابي غير مفعلة في السيرفر حالياً.", ephemeral=True)
+        return
+    
+    # حفظ التفاعل لتحديث الرسالة لاحقاً
+    pending_logins[interaction.user.id] = interaction
     
     login_url = f"{HEROKU_BASE_URL}/auth/login/{interaction.user.id}"
     
@@ -503,21 +549,51 @@ async def login_command(interaction: discord.Interaction):
 @bot.tree.command(name="logout", description="تسجيل الخروج وحذف بيانات ربط جوجل من البوت")
 async def logout_command(interaction: discord.Interaction):
     if not db_pool:
-        return await interaction.response.send_message("❌ قاعدة البيانات غير متصلة.", ephemeral=True)
+        await interaction.response.send_message("❌ قاعدة البيانات غير متصلة.", ephemeral=True)
+        return
     
     async with db_pool.acquire() as conn:
         result = await conn.execute("DELETE FROM user_tokens WHERE discord_id = $1", interaction.user.id)
         
         if result == "DELETE 1":
-            await interaction.response.send_message("✅ تم تسجيل الخروج بنجاح. تم حذف جميع مفاتيح الربط الخاصة بك من السيرفر.", ephemeral=True)
+            await interaction.response.send_message("✅ تم تسجيل الخروج بنجاح. تم حذف جميع مفاتيح الربط الخاصة بك.", ephemeral=True)
         else:
             await interaction.response.send_message("⚠️ حسابك غير مربوط بجوجل أساساً.", ephemeral=True)
+
+@bot.tree.command(name="profile", description="عرض الملف الشخصي وإحصائيات الاستخدام الخاصة بك")
+async def profile_command(interaction: discord.Interaction):
+    if not db_pool:
+        await interaction.response.send_message("❌ قاعدة البيانات غير متصلة.", ephemeral=True)
+        return
+        
+    async with db_pool.acquire() as conn:
+        user_data = await conn.fetchrow("SELECT * FROM user_tokens WHERE discord_id = $1", interaction.user.id)
+        
+    if not user_data:
+        await interaction.response.send_message("❌ أنت غير مسجل! استخدم أمر `/login` لربط حساب جوجل وإنشاء ملف شخصي.", ephemeral=True)
+        return
+        
+    email = user_data.get('google_email') or "غير متوفر"
+    extracted = user_data.get('files_extracted') or 0
+    uploaded = user_data.get('files_uploaded') or 0
+    
+    avatar_url = interaction.user.avatar.url if interaction.user.avatar else interaction.user.default_avatar.url
+    
+    embed = discord.Embed(title="👤 الملف الشخصي والإحصائيات", color=discord.Color.gold())
+    embed.set_thumbnail(url=avatar_url)
+    embed.add_field(name="الاسم في ديسكورد:", value=f"`{interaction.user.name}`", inline=True)
+    embed.add_field(name="حساب جوجل المربوط:", value=f"`{email}`", inline=False)
+    embed.add_field(name="📥 الملفات المستخرجة:", value=f"`{extracted}` ملف", inline=True)
+    embed.add_field(name="☁️ المرفوعة لدرايف:", value=f"`{uploaded}` ملف", inline=True)
+    embed.set_footer(text="شكراً لثقتك واستخدامك للبوت!")
+    
+    await interaction.response.send_message(embed=embed)
 
 # --- أمر السلاش الرئيسي ---
 @bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف")
 @app_commands.describe(
     url="رابط جوجل درايف للملف",
-    expected_pages="عدد الصفحات (اختياري) للحصول على شريط تقدم ووقت مقدر دقيق",
+    expected_pages="عدد الصفحات (اختياري)",
     quality="اختر جودة الصور المستخرجة",
     speed="اختر سرعة عملية السحب",
     save_to_drive="هل ترغب برفع الملف مباشرة لحسابك في درايف؟ (يجب استخدام أمر /login أولاً)"
@@ -535,34 +611,56 @@ async def fetch_pdf(
     user_creds_data = None
     if save_to_drive:
         if not db_pool:
-            return await interaction.edit_original_response(content="❌ عذراً، ميزة الرفع السحابي معطلة حالياً بسبب مشكلة في قاعدة البيانات.")
-        
+            await interaction.edit_original_response(content="❌ عذراً، ميزة الرفع السحابي معطلة حالياً.")
+            return
+            
         async with db_pool.acquire() as conn:
             user_creds_data = await conn.fetchrow("SELECT * FROM user_tokens WHERE discord_id = $1", interaction.user.id)
             
         if not user_creds_data:
-            return await interaction.edit_original_response(content="❌ **يجب عليك تسجيل الدخول أولاً!** الرجاء استخدام أمر `/login` لربط حسابك بجوجل، ثم أعد المحاولة.")
+            await interaction.edit_original_response(content="❌ **يجب عليك تسجيل الدخول أولاً!** استخدم أمر `/login`.")
+            return
 
+    # إعدادات الجودة والتحجيم
     if "عالية" in quality:
-        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 3.0, "2560,1440", 8000
+        img_format = "image/jpeg"
+        img_quality = 1.0
+        img_ext = "jpg"
+        scale_factor = 2.0
+        window_size = "1920,1080"
+        max_dim = 3500
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 0.5, "jpg", 1.0, "800,1200", 2000
+        img_format = "image/jpeg"
+        img_quality = 0.5
+        img_ext = "jpg"
+        scale_factor = 1.0
+        window_size = "800,600"
+        max_dim = 1500
     else:
-        img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 0.8, "jpg", 1.5, "1200,1600", 4000
+        img_format = "image/jpeg"
+        img_quality = 0.8
+        img_ext = "jpg"
+        scale_factor = 1.5
+        window_size = "1280,720"
+        max_dim = 2500
         
+    # إعدادات السرعة والتمرير
     if "بطيئة" in speed:
-        img_sleep, scroll_sleep = 1.2, 1.5
+        img_sleep = 1.2
+        scroll_sleep = 1.5
     elif "سريعة" in speed:
-        img_sleep, scroll_sleep = 0.3, 0.8
+        img_sleep = 0.3
+        scroll_sleep = 0.8
     else:
-        img_sleep, scroll_sleep = 0.8, 1.2
+        img_sleep = 0.8
+        scroll_sleep = 1.2
 
     progress_state = {
-        "status": "تهيئة المتصفح...",
+        "status": "تهيئة...",
         "pages": 0,
-        "title": "جاري التعرف على الملف...",
+        "title": "جاري التعرف...",
         "start_time": None,
-        "extracting": True, 
+        "extracting": True,
         "done": False,
         "error": None
     }
@@ -590,20 +688,14 @@ async def fetch_pdf(
         
         if progress_state.get("extracting", True):
             eta_text = "جاري الحساب..."
-            if start_time and current_pages > 0:
-                elapsed_time = time.time() - start_time
-                if expected_pages:
-                    time_per_page = elapsed_time / current_pages
-                    pages_left = max(0, expected_pages - current_pages)
-                    eta_seconds = int(time_per_page * pages_left)
-                    
-                    mins, secs = divmod(eta_seconds, 60)
-                    if mins > 0:
-                        eta_text = f"حوالي {mins} دقيقة و {secs} ثانية"
-                    else:
-                        eta_text = f"حوالي {secs} ثانية"
+            if start_time and current_pages > 0 and expected_pages:
+                eta_seconds = int(((time.time() - start_time) / current_pages) * max(0, expected_pages - current_pages))
+                mins, secs = divmod(eta_seconds, 60)
+                
+                if mins > 0:
+                    eta_text = f"حوالي {mins} دقيقة و {secs} ثانية"
                 else:
-                    eta_text = "غير معروف"
+                    eta_text = f"حوالي {secs} ثانية"
             elif not expected_pages:
                 eta_text = "غير معروف"
         else:
@@ -631,7 +723,7 @@ async def fetch_pdf(
                 await current_message.edit(embed=embed)
             except Exception:
                 pass 
-        
+                
         await asyncio.sleep(5) 
     
     result = await task
@@ -642,9 +734,15 @@ async def fetch_pdf(
         folder_id = result["folder_id"]
         display_name = result["display_name"]
         
-        file_size_bytes = os.path.getsize(file_path)
-        file_size_mb = file_size_bytes / (1024 * 1024)
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("UPDATE user_tokens SET files_extracted = files_extracted + 1 WHERE discord_id = $1", interaction.user.id)
+            except Exception:
+                pass
+
         final_embed = discord.Embed(
             title="✅ اكتملت المعالجة!", 
             description=f"تم استخراج جميع الصفحات لملف **{display_name}**.",
@@ -668,31 +766,31 @@ async def fetch_pdf(
                     final_embed.add_field(name="☁️ تم الرفع لحسابك بنجاح!", value=f"[اضغط هنا لفتح الملف في جوجل درايف الخاص بك]({upload_result['link']})", inline=False)
                     final_embed.set_footer(text="تم الحفظ بنجاح في حساب جوجل درايف المربوط.")
                     
+                    if db_pool:
+                        try:
+                            async with db_pool.acquire() as conn:
+                                await conn.execute("UPDATE user_tokens SET files_uploaded = files_uploaded + 1 WHERE discord_id = $1", interaction.user.id)
+                        except Exception:
+                            pass
+                    
                     expiration_times[file_path] = time.time() + 5 
                     asyncio.create_task(background_cleanup_task(file_path))
-                    
                     await current_message.edit(embed=final_embed, view=None)
                 else:
-                    final_embed.add_field(name="⚠️ فشل الرفع للدرايف (قد يكون المساحة ممتلئة):", value=f"```\n{upload_result['error']}\n```", inline=False)
+                    final_embed.add_field(name="⚠️ فشل الرفع للدرايف:", value=f"```\n{upload_result['error']}\n```", inline=False)
             except Exception as e:
                 final_embed.add_field(name="⚠️ حدث خطأ غير متوقع أثناء الرفع:", value=str(e), inline=False)
 
         if not save_to_drive or not upload_result.get("success"):
             encoded_filename = urllib.parse.quote(filename)
             direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
-            
             expiration_times[file_path] = time.time() + 900 
             
-            final_embed.add_field(
-                name="💡 معلومة مفيدة:", 
-                value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية لتأخير الحذف التلقائي.", 
-                inline=False
-            )
-            final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً من سيرفر البوت بعد 15 دقيقة في حال عدم تمديد الوقت.")
+            final_embed.add_field(name="💡 معلومة مفيدة:", value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية.", inline=False)
+            final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً من السيرفر بعد 15 دقيقة.")
             
             view = FileManagementView(file_path, direct_link, display_name)
             await current_message.edit(embed=final_embed, view=view)
-            
             asyncio.create_task(background_cleanup_task(file_path))
             
     else:
