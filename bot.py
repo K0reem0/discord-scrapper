@@ -8,11 +8,10 @@ import base64
 import re
 import shutil
 import gc
+import urllib.parse
 from typing import Literal
 from io import BytesIO
-from PIL import Image, JpegImagePlugin
-import urllib.parse
-
+from PIL import Image, JpegImagePlugin  # JpegImagePlugin لمنع خطأ الـ JPEG
 
 # استيرادات خادم الويب
 from aiohttp import web
@@ -33,7 +32,6 @@ DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # قاموس لتتبع أوقات حذف الملفات (لتمديد الوقت)
-# المفتاح: مسار الملف، القيمة: توقيت الحذف (Timestamp)
 expiration_times = {}
 
 intents = discord.Intents.default()
@@ -43,13 +41,15 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # --- إعدادات خادم الويب ---
 async def download_file_handler(request):
     filename = request.match_info.get('filename')
-    file_path = os.path.join(DOWNLOADS_DIR, filename)
+    # فك تشفير الرابط للحصول على اسم الملف الصحيح من القرص
+    decoded_filename = urllib.parse.unquote(filename)
+    file_path = os.path.join(DOWNLOADS_DIR, decoded_filename)
     
     if not os.path.exists(file_path):
         return web.Response(status=404, text="❌ الملف غير موجود أو تم حذفه لانتهاء صلاحيته.")
     
     return web.FileResponse(file_path, headers={
-        'Content-Disposition': f'attachment; filename="{filename}"'
+        'Content-Disposition': f'attachment; filename="{decoded_filename}"'
     })
 
 async def health_check_handler(request):
@@ -68,53 +68,50 @@ async def start_web_server():
     await site.start()
     print(f"[INFO] Web server started on port {port}")
 
-# --- دالة الحذف الذكية (تدعم التمديد) ---
+# --- دالة الحذف الذكية ---
 async def background_cleanup_task(file_path):
-    """مهمة تعمل في الخلفية تراقب توقيت الحذف"""
     while file_path in expiration_times:
         current_time = time.time()
         if current_time >= expiration_times[file_path]:
             if os.path.exists(file_path):
                 try:
                     os.remove(file_path)
-                    print(f"[INFO] 🗑️ تم حذف الملف تلقائياً بعد انتهاء الوقت: {file_path}")
+                    print(f"[INFO] 🗑️ تم حذف الملف تلقائياً: {file_path}")
                 except Exception as e:
-                    print(f"[ERROR] فشل حذف الملف: {e}")
+                    pass
             expiration_times.pop(file_path, None)
             break
-        await asyncio.sleep(30) # التحقق كل 30 ثانية لتوفير موارد السيرفر
+        await asyncio.sleep(30)
 
 # --- كلاس الأزرار (View) ---
 class FileManagementView(ui.View):
     def __init__(self, file_path, download_url, display_name):
-        super().__init__(timeout=None) # الأزرار تبقى تعمل بلا توقف
+        super().__init__(timeout=None)
         self.file_path = file_path
         self.download_url = download_url
         self.display_name = display_name
         
-        # زر التحميل كرابط مباشر
-        self.add_item(ui.Button(label="تحميل الملف", url=self.download_url, style=discord.ButtonStyle.link))
+        # إضافة الأزرار بنفس الصف (row=0) لتوحيد الشكل
+        self.add_item(ui.Button(label="تحميل الملف", url=self.download_url, style=discord.ButtonStyle.link, emoji="📥", row=0))
 
-    @ui.button(label="تمديد الوقت (10 د)", style=discord.ButtonStyle.primary, emoji="⏳")
+    @ui.button(label="تمديد الوقت (+10د)", style=discord.ButtonStyle.primary, emoji="⏳", row=0)
     async def extend_timer(self, interaction: discord.Interaction, button: ui.Button):
         if self.file_path in expiration_times:
-            expiration_times[self.file_path] += 600 # إضافة 10 دقائق (600 ثانية)
+            expiration_times[self.file_path] += 600
             new_expire_time = int(expiration_times[self.file_path])
             
             embed = interaction.message.embeds[0]
-            embed.set_footer(text=f"⏳ تم التمديد! سيتم الحذف عند: {time.strftime('%H:%M:%S', time.localtime(new_expire_time))}")
+            embed.set_footer(text=f"⏳ تم التمديد بنجاح! سيتم الحذف عند: {time.strftime('%H:%M:%S', time.localtime(new_expire_time))}")
             
             await interaction.response.edit_message(embed=embed)
         else:
             await interaction.response.send_message("❌ عذراً، يبدو أن الملف قد تم حذفه بالفعل.", ephemeral=True)
 
-    @ui.button(label="حذف الآن", style=discord.ButtonStyle.danger, emoji="🗑️")
+    @ui.button(label="حذف الآن", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
     async def delete_now(self, interaction: discord.Interaction, button: ui.Button):
         if os.path.exists(self.file_path):
-            try:
-                os.remove(self.file_path)
-            except Exception:
-                pass
+            try: os.remove(self.file_path)
+            except Exception: pass
             
             expiration_times.pop(self.file_path, None)
             
@@ -123,10 +120,9 @@ class FileManagementView(ui.View):
                 description=f"تم حذف الملف `{self.display_name}` بناءً على طلبك لتوفير المساحة.", 
                 color=discord.Color.light_grey()
             )
-            # إزالة الأزرار بعد الحذف
             await interaction.response.edit_message(embed=final_embed, view=None)
         else:
-            await interaction.response.send_message("❌ الملف غير موجود بالفعل، قد يكون تم حذفه مسبقاً.", ephemeral=True)
+            await interaction.response.send_message("❌ الملف غير موجود بالفعل.", ephemeral=True)
 
 # --- إعدادات Selenium ---
 def init_driver():
@@ -135,15 +131,9 @@ def init_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    
-    # تحديد أبعاد شاشة ممتازة
     chrome_options.add_argument("--window-size=2560,1440")
-    
-    # 🔥 السر الجديد: إجبار درايف على توليد دقة فائقة الوضوح (Retina/High-DPI Trick)
     chrome_options.add_argument("--force-device-scale-factor=3.0") 
     chrome_options.add_argument("--high-dpi-support=1")
-    
-    # أوامر توفير الرام
     chrome_options.add_argument("--disable-site-isolation-trials") 
     chrome_options.add_argument("--disable-application-cache")
     chrome_options.add_argument("--js-flags=--expose-gc")
@@ -157,7 +147,6 @@ def init_driver():
     except WebDriverException as e:
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
-
 
 def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, img_sleep: float, scroll_sleep: float):
     driver = init_driver()
@@ -175,11 +164,9 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
         progress_state["status"] = "جاري فتح الصفحة وجلب المعلومات..."
         driver.get(url)
         
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.TAG_NAME, 'img'))
-        )
-        
+        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, 'img')))
         time.sleep(2) 
+        
         raw_title = driver.title.replace(" - Google Drive", "").strip()
         clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
         if not clean_title: clean_title = f"drive_doc_{output_id}"
@@ -206,7 +193,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
                         time.sleep(img_sleep) 
                         
-                        # 🔥 تمرير الصيغة والجودة من بايثون إلى جافاسكريبت
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
                             var format = arguments[1];
@@ -233,7 +219,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                             b64_string = b64_data.split(",")[1] if "," in b64_data else b64_data
                             img_bytes = base64.b64decode(b64_string)
                             
-                            # حفظ الملف بالامتداد الصحيح (png أو jpg)
                             page_path = os.path.join(temp_dir, f"page_{len(saved_images_paths):04d}.{img_ext}")
                             with open(page_path, "wb") as f:
                                 f.write(img_bytes)
@@ -268,9 +253,12 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
             progress_state["error"] = "لم يتم العثور على أي محتوى مطابق."
             return {"success": False, "error": progress_state["error"]}
         
+        # --- تغيير الحالة لتعديل الوقت المقدر (ETA) ---
+        progress_state["extracting"] = False 
         progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF..."
         
-        safe_filename = f"{output_id}_{clean_title}"
+        # إزالة الـ ID للحصول على الاسم الأصلي النقي
+        safe_filename = clean_title
         pdf_path = os.path.join(os.getcwd(), DOWNLOADS_DIR, safe_filename)
         
         first_image = Image.open(saved_images_paths[0]).convert('RGB')
@@ -325,15 +313,13 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # 🔥 إعدادات الجودة الجديدة
     if "عالية" in quality:
-        img_format, img_quality, img_ext = "image/png", 1.0, "png"  # خام بدون ضغط
+        img_format, img_quality, img_ext = "image/png", 1.0, "png"
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext = "image/jpeg", 0.5, "jpg" # مضغوطة بقوة
+        img_format, img_quality, img_ext = "image/jpeg", 0.5, "jpg"
     else:
-        img_format, img_quality, img_ext = "image/jpeg", 0.8, "jpg" # متوازنة
+        img_format, img_quality, img_ext = "image/jpeg", 0.8, "jpg"
         
-    # تحديد السرعة
     if "بطيئة" in speed:
         img_sleep = 1.2
         scroll_sleep = 1.5
@@ -349,11 +335,11 @@ async def fetch_pdf(
         "pages": 0,
         "title": "جاري التعرف على الملف...",
         "start_time": None,
+        "extracting": True, # لمعرفة هل هو في مرحلة السحب أم الدمج
         "done": False,
         "error": None
     }
     
-    # تمرير المتغيرات الجديدة للدالة
     task = asyncio.create_task(
         asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, img_sleep, scroll_sleep)
     )
@@ -375,23 +361,28 @@ async def fetch_pdf(
         p_bar = create_progress_bar(current_pages, expected_pages)
         pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
         
-        eta_text = "جاري الحساب..."
-        if start_time and current_pages > 0:
-            elapsed_time = time.time() - start_time
-            if expected_pages:
-                time_per_page = elapsed_time / current_pages
-                pages_left = max(0, expected_pages - current_pages)
-                eta_seconds = int(time_per_page * pages_left)
-                
-                mins, secs = divmod(eta_seconds, 60)
-                if mins > 0:
-                    eta_text = f"حوالي {mins} دقيقة و {secs} ثانية"
+        # --- تحديث الوقت المقدر (ETA) ---
+        if progress_state.get("extracting", True):
+            eta_text = "جاري الحساب..."
+            if start_time and current_pages > 0:
+                elapsed_time = time.time() - start_time
+                if expected_pages:
+                    time_per_page = elapsed_time / current_pages
+                    pages_left = max(0, expected_pages - current_pages)
+                    eta_seconds = int(time_per_page * pages_left)
+                    
+                    mins, secs = divmod(eta_seconds, 60)
+                    if mins > 0:
+                        eta_text = f"حوالي {mins} دقيقة و {secs} ثانية"
+                    else:
+                        eta_text = f"حوالي {secs} ثانية"
                 else:
-                    eta_text = f"حوالي {secs} ثانية"
-            else:
+                    eta_text = "غير معروف"
+            elif not expected_pages:
                 eta_text = "غير معروف"
-        elif not expected_pages:
-            eta_text = "غير معروف"
+        else:
+            # إذا انتهى السحب وبدأ التجميع
+            eta_text = "يرجى الانتظار، جاري تجهيز الملف للتحميل ⏳"
         
         embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
         embed.add_field(name="الاسم الأصلي:", value=f"`{title}`", inline=False)
@@ -420,11 +411,14 @@ async def fetch_pdf(
     
     result = await task
     
-    import urllib.parse # التأكد من وجود الاستيراد
     if result.get("success"):
         file_path = result["file_path"]
         filename = result["filename"]
         display_name = result["display_name"]
+        
+        # حساب حجم الملف بالميجابايت
+        file_size_bytes = os.path.getsize(file_path)
+        file_size_mb = file_size_bytes / (1024 * 1024)
         
         encoded_filename = urllib.parse.quote(filename)
         direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{encoded_filename}"
@@ -436,7 +430,18 @@ async def fetch_pdf(
             description=f"تم استخراج جميع الصفحات لملف **{display_name}**.",
             color=discord.Color.green()
         )
-        final_embed.set_footer(text="⚠️ سيتم حذف هذا الرابط والملف تلقائياً بعد 15 دقيقة لتوفير مساحة السيرفر.")
+        final_embed.add_field(name="حجم الملف:", value=f"`{file_size_mb:.2f} MB`", inline=True)
+        final_embed.add_field(name="عدد الصفحات:", value=f"`{progress_state['pages']}`", inline=True)
+        final_embed.add_field(name="\u200B", value="\u200B", inline=True) # حقل فارغ لتنسيق المظهر
+        
+        # شرح التمديد داخل الرسالة
+        final_embed.add_field(
+            name="💡 معلومة مفيدة:", 
+            value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية لتأخير الحذف التلقائي.", 
+            inline=False
+        )
+        
+        final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً بعد 15 دقيقة في حال عدم تمديد الوقت.")
         
         view = FileManagementView(file_path, direct_link, display_name)
         await current_message.edit(embed=final_embed, view=view)
