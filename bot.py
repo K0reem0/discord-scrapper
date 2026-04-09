@@ -135,9 +135,15 @@ def init_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    # 🔥 هنا السر: شاشة 4K لإجبار درايف على إظهار أعلى جودة ممكنة
-    chrome_options.add_argument("--window-size=3840,2160") 
     
+    # تحديد أبعاد شاشة ممتازة
+    chrome_options.add_argument("--window-size=2560,1440")
+    
+    # 🔥 السر الجديد: إجبار درايف على توليد دقة فائقة الوضوح (Retina/High-DPI Trick)
+    chrome_options.add_argument("--force-device-scale-factor=3.0") 
+    chrome_options.add_argument("--high-dpi-support=1")
+    
+    # أوامر توفير الرام
     chrome_options.add_argument("--disable-site-isolation-trials") 
     chrome_options.add_argument("--disable-application-cache")
     chrome_options.add_argument("--js-flags=--expose-gc")
