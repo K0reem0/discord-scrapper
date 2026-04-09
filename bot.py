@@ -42,7 +42,6 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 # إعدادات جوجل درايف
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 
-# إعدادات الـ OAuth
 if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET:
     client_config = {
         "web": {
@@ -59,6 +58,9 @@ else:
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 expiration_times = {}
+
+# قاموس لحفظ مفاتيح التحقق المؤقتة لجوجل (PKCE)
+auth_sessions = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -132,7 +134,12 @@ async def auth_login_handler(request):
     flow = Flow.from_client_config(client_config, scopes=SCOPES)
     flow.redirect_uri = f"{HEROKU_BASE_URL}/auth/google/callback"
     
-    auth_url, _ = flow.authorization_url(prompt='consent', access_type='offline', state=discord_id)
+    auth_url, state = flow.authorization_url(prompt='consent', access_type='offline', state=discord_id)
+    
+    # حفظ كود التحقق الأمني المؤقت
+    if hasattr(flow, 'code_verifier'):
+        auth_sessions[state] = flow.code_verifier
+        
     return web.HTTPFound(auth_url)
 
 async def auth_callback_handler(request):
@@ -145,6 +152,11 @@ async def auth_callback_handler(request):
     try:
         flow = Flow.from_client_config(client_config, scopes=SCOPES)
         flow.redirect_uri = f"{HEROKU_BASE_URL}/auth/google/callback"
+        
+        # استعادة كود التحقق الأمني
+        if state in auth_sessions:
+            flow.code_verifier = auth_sessions.pop(state)
+            
         flow.fetch_token(code=code)
         creds = flow.credentials
         
@@ -176,9 +188,9 @@ async def auth_callback_handler(request):
             </body>
         </html>
         """
-        return web.Response(text=success_html, content_type="text/html; charset=utf-8")
+        return web.Response(text=success_html, content_type="text/html", charset="utf-8")
     except Exception as e:
-        return web.Response(text=f"❌ حدث خطأ أثناء ربط الحساب: {e}", content_type="text/html; charset=utf-8")
+        return web.Response(text=f"❌ حدث خطأ أثناء ربط الحساب: {e}", content_type="text/html", charset="utf-8")
 
 async def health_check_handler(request):
     return web.Response(text="✅ خادم الملفات ونظام التسجيل يعمل بنجاح!")
@@ -520,7 +532,6 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # 🌟 التحقق من وجود بيانات المستخدم في الداتا بيز إذا طلب الرفع للدرايف
     user_creds_data = None
     if save_to_drive:
         if not db_pool:
@@ -532,7 +543,6 @@ async def fetch_pdf(
         if not user_creds_data:
             return await interaction.edit_original_response(content="❌ **يجب عليك تسجيل الدخول أولاً!** الرجاء استخدام أمر `/login` لربط حسابك بجوجل، ثم أعد المحاولة.")
 
-    # تحديد الجودة
     if "عالية" in quality:
         img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 1.0, "jpg", 3.0, "2560,1440", 8000
     elif "منخفضة" in quality:
@@ -540,7 +550,6 @@ async def fetch_pdf(
     else:
         img_format, img_quality, img_ext, scale_factor, window_size, max_dim = "image/jpeg", 0.8, "jpg", 1.5, "1200,1600", 4000
         
-    # تحديد السرعة
     if "بطيئة" in speed:
         img_sleep, scroll_sleep = 1.2, 1.5
     elif "سريعة" in speed:
@@ -647,7 +656,6 @@ async def fetch_pdf(
         
         upload_result = {}
         
-        # 🌟 مرحلة الرفع لدرايف إذا طلب المستخدم ذلك وكان مسجلاً
         if save_to_drive and user_creds_data:
             uploading_embed = discord.Embed(title="☁️ جاري الرفع لجوجل درايف...", color=discord.Color.gold())
             await current_message.edit(embed=uploading_embed)
@@ -660,7 +668,6 @@ async def fetch_pdf(
                     final_embed.add_field(name="☁️ تم الرفع لحسابك بنجاح!", value=f"[اضغط هنا لفتح الملف في جوجل درايف الخاص بك]({upload_result['link']})", inline=False)
                     final_embed.set_footer(text="تم الحفظ بنجاح في حساب جوجل درايف المربوط.")
                     
-                    # حذف الملف من السيرفر فوراً لتوفير المساحة بما أنه رُفع بنجاح
                     expiration_times[file_path] = time.time() + 5 
                     asyncio.create_task(background_cleanup_task(file_path))
                     
@@ -670,7 +677,6 @@ async def fetch_pdf(
             except Exception as e:
                 final_embed.add_field(name="⚠️ حدث خطأ غير متوقع أثناء الرفع:", value=str(e), inline=False)
 
-        # 🌟 إذا لم يطلب الرفع، أو إذا فشل الرفع لأي سبب، نعطيه رابط التحميل المباشر من هيروكو
         if not save_to_drive or not upload_result.get("success"):
             encoded_filename = urllib.parse.quote(filename)
             direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
