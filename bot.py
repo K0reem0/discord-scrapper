@@ -10,7 +10,7 @@ import shutil
 import gc
 from typing import Literal
 from io import BytesIO
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 import urllib.parse
 
 
