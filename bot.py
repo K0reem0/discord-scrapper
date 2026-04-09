@@ -135,9 +135,9 @@ def init_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+    # 🔥 هنا السر: شاشة 4K لإجبار درايف على إظهار أعلى جودة ممكنة
+    chrome_options.add_argument("--window-size=3840,2160") 
     
-    # أوامر تقييد استهلاك الذاكرة في Chrome
     chrome_options.add_argument("--disable-site-isolation-trials") 
     chrome_options.add_argument("--disable-application-cache")
     chrome_options.add_argument("--js-flags=--expose-gc")
@@ -152,7 +152,8 @@ def init_driver():
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_quality: float, img_sleep: float, scroll_sleep: float):
+
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, img_sleep: float, scroll_sleep: float):
     driver = init_driver()
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
@@ -175,12 +176,8 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
         time.sleep(2) 
         raw_title = driver.title.replace(" - Google Drive", "").strip()
         clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
-        
-        if not clean_title:
-            clean_title = f"drive_doc_{output_id}"
-            
-        if not clean_title.lower().endswith(".pdf"):
-            clean_title += ".pdf"
+        if not clean_title: clean_title = f"drive_doc_{output_id}"
+        if not clean_title.lower().endswith(".pdf"): clean_title += ".pdf"
             
         progress_state["title"] = clean_title
         progress_state["status"] = "جاري سحب الصفحات..."
@@ -188,7 +185,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
         scroll_attempts = 0
         max_attempts = 2000
         empty_scrolls = 0
-        
         progress_state["start_time"] = time.time()
         
         while scroll_attempts < max_attempts:
@@ -204,9 +200,11 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
                         time.sleep(img_sleep) 
                         
+                        # 🔥 تمرير الصيغة والجودة من بايثون إلى جافاسكريبت
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
-                            var quality = arguments[1];
+                            var format = arguments[1];
+                            var quality = arguments[2];
                             if (img.naturalWidth === 0) return null;
                             
                             var canvasElement = document.createElement("canvas");
@@ -215,22 +213,22 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                             canvasElement.height = img.naturalHeight;
                             
                             con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
-                            var data = canvasElement.toDataURL('image/jpeg', quality);
+                            var data = canvasElement.toDataURL(format, quality);
                             
-                            // تدمير الكانفاس لتفريغ الرام
                             con.clearRect(0, 0, canvasElement.width, canvasElement.height);
                             canvasElement.width = 0;
                             canvasElement.height = 0;
                             canvasElement = null;
                             
                             return data;
-                        """, img, img_quality)
+                        """, img, img_format, img_quality)
                         
                         if b64_data:
                             b64_string = b64_data.split(",")[1] if "," in b64_data else b64_data
                             img_bytes = base64.b64decode(b64_string)
                             
-                            page_path = os.path.join(temp_dir, f"page_{len(saved_images_paths):04d}.jpg")
+                            # حفظ الملف بالامتداد الصحيح (png أو jpg)
+                            page_path = os.path.join(temp_dir, f"page_{len(saved_images_paths):04d}.{img_ext}")
                             with open(page_path, "wb") as f:
                                 f.write(img_bytes)
                                 
@@ -241,7 +239,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                             extracted_in_this_pass = True
                             empty_scrolls = 0
                             
-                            # الإجبار على مسح المتغيرات لتفريغ ذاكرة بايثون
                             del b64_data, b64_string, img_bytes
                             gc.collect() 
                             break 
@@ -259,7 +256,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                 
             if empty_scrolls >= 6:
                 break
-                
             scroll_attempts += 1
 
         if not saved_images_paths:
@@ -278,24 +274,16 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                 with Image.open(img_path) as img:
                     yield img.convert('RGB')
 
-        first_image.save(
-            pdf_path, 
-            save_all=True, 
-            append_images=image_generator(), 
-            resolution=100.0
-        )
+        first_image.save(pdf_path, save_all=True, append_images=image_generator(), resolution=100.0)
         
         return {"success": True, "file_path": pdf_path, "filename": safe_filename, "display_name": clean_title}
 
     except Exception as e:
-        progress_state["error"] = str(e)
         return {"success": False, "error": str(e)}
     finally:
         progress_state["done"] = True
-        if driver:
-            driver.quit()
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        if driver: driver.quit()
+        if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
 
 @bot.event
 async def on_ready():
@@ -331,13 +319,13 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # تحديد الجودة
+    # 🔥 إعدادات الجودة الجديدة
     if "عالية" in quality:
-        img_quality = 0.9
+        img_format, img_quality, img_ext = "image/png", 1.0, "png"  # خام بدون ضغط
     elif "منخفضة" in quality:
-        img_quality = 0.5
+        img_format, img_quality, img_ext = "image/jpeg", 0.5, "jpg" # مضغوطة بقوة
     else:
-        img_quality = 0.7
+        img_format, img_quality, img_ext = "image/jpeg", 0.8, "jpg" # متوازنة
         
     # تحديد السرعة
     if "بطيئة" in speed:
@@ -359,8 +347,9 @@ async def fetch_pdf(
         "error": None
     }
     
+    # تمرير المتغيرات الجديدة للدالة
     task = asyncio.create_task(
-        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_quality, img_sleep, scroll_sleep)
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, img_sleep, scroll_sleep)
     )
     
     original_response = await interaction.original_response()
@@ -371,7 +360,6 @@ async def fetch_pdf(
         
     message_creation_time = time.time()
     
-    # حلقة التحديث المستمر
     while not task.done():
         status_msg = progress_state["status"]
         current_pages = progress_state["pages"]
@@ -381,7 +369,6 @@ async def fetch_pdf(
         p_bar = create_progress_bar(current_pages, expected_pages)
         pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
         
-        # حساب الوقت المقدر
         eta_text = "جاري الحساب..."
         if start_time and current_pages > 0:
             elapsed_time = time.time() - start_time
@@ -396,9 +383,9 @@ async def fetch_pdf(
                 else:
                     eta_text = f"حوالي {secs} ثانية"
             else:
-                eta_text = "غير معروف (لم يتم إدخال الإجمالي)"
+                eta_text = "غير معروف"
         elif not expected_pages:
-            eta_text = "غير معروف (لم يتم إدخال الإجمالي)"
+            eta_text = "غير معروف"
         
         embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
         embed.add_field(name="الاسم الأصلي:", value=f"`{title}`", inline=False)
@@ -408,9 +395,8 @@ async def fetch_pdf(
         embed.add_field(name="الوقت المقدر (ETA):", value=f"`{eta_text}`", inline=True)
         embed.set_footer(text=f"⚙️ الجودة: {quality.split(' ')[0]} | السرعة: {speed.split(' ')[0]}")
         
-        # مكافح انتهاء صلاحية رسالة الديسكورد (15 دقيقة)
         time_elapsed_since_creation = time.time() - message_creation_time
-        if time_elapsed_since_creation >= 840: # 840 ثانية = 14 دقيقة
+        if time_elapsed_since_creation >= 840: 
             try:
                 new_message = await interaction.channel.send(embed=embed)
                 await current_message.delete()
@@ -426,20 +412,17 @@ async def fetch_pdf(
         
         await asyncio.sleep(5) 
     
-    # بعد انتهاء الاستخراج
     result = await task
     
+    import urllib.parse # التأكد من وجود الاستيراد
     if result.get("success"):
         file_path = result["file_path"]
         filename = result["filename"]
         display_name = result["display_name"]
         
-        # تشفير اسم الملف ليكون صالحاً كـ رابط ويب (تحويل المسافات والحروف العربية)
         encoded_filename = urllib.parse.quote(filename)
         direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{encoded_filename}"
-
         
-        # تحديد وقت الحذف الافتراضي بـ 15 دقيقة وإضافته للقاموس
         expiration_times[file_path] = time.time() + 900 
         
         final_embed = discord.Embed(
@@ -449,11 +432,9 @@ async def fetch_pdf(
         )
         final_embed.set_footer(text="⚠️ سيتم حذف هذا الرابط والملف تلقائياً بعد 15 دقيقة لتوفير مساحة السيرفر.")
         
-        # إضافة الأزرار
         view = FileManagementView(file_path, direct_link, display_name)
         await current_message.edit(embed=final_embed, view=view)
         
-        # تشغيل المراقب الذكي لحذف الملف
         asyncio.create_task(background_cleanup_task(file_path))
         
     else:
