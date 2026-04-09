@@ -11,6 +11,8 @@ import gc
 from typing import Literal
 from io import BytesIO
 from PIL import Image
+import urllib.parse
+
 
 # استيرادات خادم الويب
 from aiohttp import web
@@ -432,7 +434,10 @@ async def fetch_pdf(
         filename = result["filename"]
         display_name = result["display_name"]
         
-        direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{filename}"
+        # تشفير اسم الملف ليكون صالحاً كـ رابط ويب (تحويل المسافات والحروف العربية)
+        encoded_filename = urllib.parse.quote(filename)
+        direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{encoded_filename}"
+
         
         # تحديد وقت الحذف الافتراضي بـ 15 دقيقة وإضافته للقاموس
         expiration_times[file_path] = time.time() + 900 
