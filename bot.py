@@ -11,7 +11,7 @@ import gc
 import urllib.parse
 from typing import Literal
 from io import BytesIO
-from PIL import Image, JpegImagePlugin  # JpegImagePlugin لمنع خطأ الـ JPEG
+from PIL import Image, JpegImagePlugin
 
 # استيرادات خادم الويب
 from aiohttp import web
@@ -38,12 +38,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- إعدادات خادم الويب ---
+# --- إعدادات خادم الويب (محدثة لتدعم المجلدات) ---
 async def download_file_handler(request):
+    folder_id = request.match_info.get('folder_id')
     filename = request.match_info.get('filename')
-    # فك تشفير الرابط للحصول على اسم الملف الصحيح من القرص
+    
     decoded_filename = urllib.parse.unquote(filename)
-    file_path = os.path.join(DOWNLOADS_DIR, decoded_filename)
+    # الوصول للملف داخل مجلد الـ ID
+    file_path = os.path.join(DOWNLOADS_DIR, folder_id, decoded_filename)
     
     if not os.path.exists(file_path):
         return web.Response(status=404, text="❌ الملف غير موجود أو تم حذفه لانتهاء صلاحيته.")
@@ -58,7 +60,8 @@ async def health_check_handler(request):
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', health_check_handler)
-    app.router.add_get(f'/{DOWNLOADS_DIR}/{{filename}}', download_file_handler)
+    # تحديث مسار الرابط ليتضمن مجلد الـ ID
+    app.router.add_get(f'/{DOWNLOADS_DIR}/{{folder_id}}/{{filename}}', download_file_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()
@@ -68,17 +71,22 @@ async def start_web_server():
     await site.start()
     print(f"[INFO] Web server started on port {port}")
 
-# --- دالة الحذف الذكية ---
+# --- دالة الحذف الذكية (تحذف الملف ومجلده) ---
 async def background_cleanup_task(file_path):
     while file_path in expiration_times:
         current_time = time.time()
         if current_time >= expiration_times[file_path]:
             if os.path.exists(file_path):
                 try:
-                    os.remove(file_path)
+                    os.remove(file_path) # حذف الملف
                     print(f"[INFO] 🗑️ تم حذف الملف تلقائياً: {file_path}")
+                    
+                    # حذف المجلد إذا أصبح فارغاً
+                    folder_path = os.path.dirname(file_path)
+                    if os.path.exists(folder_path) and not os.listdir(folder_path):
+                        os.rmdir(folder_path)
                 except Exception as e:
-                    pass
+                    print(f"[ERROR] فشل مسح الملف/المجلد: {e}")
             expiration_times.pop(file_path, None)
             break
         await asyncio.sleep(30)
@@ -91,10 +99,9 @@ class FileManagementView(ui.View):
         self.download_url = download_url
         self.display_name = display_name
         
-        # إضافة الأزرار بنفس الصف (row=0) لتوحيد الشكل
-        self.add_item(ui.Button(label="تحميل الملف", url=self.download_url, style=discord.ButtonStyle.link, emoji="📥", row=0))
+        self.add_item(ui.Button(label="تحميل", url=self.download_url, style=discord.ButtonStyle.link, emoji="📥", row=0))
 
-    @ui.button(label="تمديد الوقت (+10د)", style=discord.ButtonStyle.primary, emoji="⏳", row=0)
+    @ui.button(label="تمديد", style=discord.ButtonStyle.primary, emoji="⏳", row=0)
     async def extend_timer(self, interaction: discord.Interaction, button: ui.Button):
         if self.file_path in expiration_times:
             expiration_times[self.file_path] += 600
@@ -107,10 +114,14 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ عذراً، يبدو أن الملف قد تم حذفه بالفعل.", ephemeral=True)
 
-    @ui.button(label="حذف الآن", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+    @ui.button(label="حذف", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
     async def delete_now(self, interaction: discord.Interaction, button: ui.Button):
         if os.path.exists(self.file_path):
-            try: os.remove(self.file_path)
+            try: 
+                os.remove(self.file_path)
+                folder_path = os.path.dirname(self.file_path)
+                if os.path.exists(folder_path) and not os.listdir(folder_path):
+                    os.rmdir(folder_path)
             except Exception: pass
             
             expiration_times.pop(self.file_path, None)
@@ -124,16 +135,19 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ الملف غير موجود بالفعل.", ephemeral=True)
 
-# --- إعدادات Selenium ---
-def init_driver():
+# --- إعدادات Selenium (محدثة لتقبل كثافة البكسلات) ---
+def init_driver(scale_factor: float):
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=2560,1440")
-    chrome_options.add_argument("--force-device-scale-factor=3.0") 
+    
+    # 🔥 تغيير كثافة البكسلات بناءً على اختيار المستخدم
+    chrome_options.add_argument(f"--force-device-scale-factor={scale_factor}") 
     chrome_options.add_argument("--high-dpi-support=1")
+    
     chrome_options.add_argument("--disable-site-isolation-trials") 
     chrome_options.add_argument("--disable-application-cache")
     chrome_options.add_argument("--js-flags=--expose-gc")
@@ -148,8 +162,8 @@ def init_driver():
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, img_sleep: float, scroll_sleep: float):
-    driver = init_driver()
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, scale_factor: float, img_sleep: float, scroll_sleep: float):
+    driver = init_driver(scale_factor)
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
         return {"success": False, "error": progress_state["error"]}
@@ -157,7 +171,12 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
     processed_urls = set()
     saved_images_paths = []
     
-    temp_dir = os.path.join(DOWNLOADS_DIR, f"temp_{output_id}")
+    # إنشاء مجلد رئيسي خاص بالطلب (بالأيدي)
+    user_dir = os.path.join(DOWNLOADS_DIR, output_id)
+    os.makedirs(user_dir, exist_ok=True)
+    
+    # مجلد مؤقت داخل مجلد المستخدم للصور
+    temp_dir = os.path.join(user_dir, "temp_images")
     os.makedirs(temp_dir, exist_ok=True)
     
     try:
@@ -253,13 +272,11 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
             progress_state["error"] = "لم يتم العثور على أي محتوى مطابق."
             return {"success": False, "error": progress_state["error"]}
         
-        # --- تغيير الحالة لتعديل الوقت المقدر (ETA) ---
         progress_state["extracting"] = False 
         progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF..."
         
-        # إزالة الـ ID للحصول على الاسم الأصلي النقي
-        safe_filename = clean_title
-        pdf_path = os.path.join(os.getcwd(), DOWNLOADS_DIR, safe_filename)
+        # حفظ الـ PDF داخل مجلد المستخدم بالاسم الأصلي النقي فقط
+        pdf_path = os.path.join(user_dir, clean_title)
         
         first_image = Image.open(saved_images_paths[0]).convert('RGB')
         
@@ -270,13 +287,14 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
 
         first_image.save(pdf_path, save_all=True, append_images=image_generator(), resolution=100.0)
         
-        return {"success": True, "file_path": pdf_path, "filename": safe_filename, "display_name": clean_title}
+        return {"success": True, "file_path": pdf_path, "filename": clean_title, "folder_id": output_id}
 
     except Exception as e:
         return {"success": False, "error": str(e)}
     finally:
         progress_state["done"] = True
         if driver: driver.quit()
+        # حذف مجلد الصور المؤقتة فقط وترك الـ PDF
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
 
 @bot.event
@@ -313,35 +331,33 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
+    # تحديد الجودة وكثافة البكسلات (Scale Factor)
     if "عالية" in quality:
-        img_format, img_quality, img_ext = "image/png", 1.0, "png"
+        img_format, img_quality, img_ext, scale_factor = "image/png", 1.0, "png", 3.0
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext = "image/jpeg", 0.5, "jpg"
+        img_format, img_quality, img_ext, scale_factor = "image/jpeg", 0.5, "jpg", 1.0
     else:
-        img_format, img_quality, img_ext = "image/jpeg", 0.8, "jpg"
+        img_format, img_quality, img_ext, scale_factor = "image/jpeg", 0.8, "jpg", 1.5
         
     if "بطيئة" in speed:
-        img_sleep = 1.2
-        scroll_sleep = 1.5
+        img_sleep, scroll_sleep = 1.2, 1.5
     elif "سريعة" in speed:
-        img_sleep = 0.3
-        scroll_sleep = 0.8
+        img_sleep, scroll_sleep = 0.3, 0.8
     else:
-        img_sleep = 0.8
-        scroll_sleep = 1.2
+        img_sleep, scroll_sleep = 0.8, 1.2
 
     progress_state = {
         "status": "تهيئة المتصفح...",
         "pages": 0,
         "title": "جاري التعرف على الملف...",
         "start_time": None,
-        "extracting": True, # لمعرفة هل هو في مرحلة السحب أم الدمج
+        "extracting": True, 
         "done": False,
         "error": None
     }
     
     task = asyncio.create_task(
-        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, img_sleep, scroll_sleep)
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, scale_factor, img_sleep, scroll_sleep)
     )
     
     original_response = await interaction.original_response()
@@ -361,7 +377,6 @@ async def fetch_pdf(
         p_bar = create_progress_bar(current_pages, expected_pages)
         pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
         
-        # --- تحديث الوقت المقدر (ETA) ---
         if progress_state.get("extracting", True):
             eta_text = "جاري الحساب..."
             if start_time and current_pages > 0:
@@ -381,7 +396,6 @@ async def fetch_pdf(
             elif not expected_pages:
                 eta_text = "غير معروف"
         else:
-            # إذا انتهى السحب وبدأ التجميع
             eta_text = "يرجى الانتظار، جاري تجهيز الملف للتحميل ⏳"
         
         embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
@@ -414,36 +428,34 @@ async def fetch_pdf(
     if result.get("success"):
         file_path = result["file_path"]
         filename = result["filename"]
-        display_name = result["display_name"]
+        folder_id = result["folder_id"]
         
-        # حساب حجم الملف بالميجابايت
         file_size_bytes = os.path.getsize(file_path)
         file_size_mb = file_size_bytes / (1024 * 1024)
         
         encoded_filename = urllib.parse.quote(filename)
-        direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{encoded_filename}"
+        # الرابط الآن يتضمن مجلد الـ ID
+        direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
         
         expiration_times[file_path] = time.time() + 900 
         
         final_embed = discord.Embed(
             title="✅ تم تجهيز الملف بنجاح!", 
-            description=f"تم استخراج جميع الصفحات لملف **{display_name}**.",
+            description=f"تم استخراج جميع الصفحات لملف **{filename}**.",
             color=discord.Color.green()
         )
         final_embed.add_field(name="حجم الملف:", value=f"`{file_size_mb:.2f} MB`", inline=True)
         final_embed.add_field(name="عدد الصفحات:", value=f"`{progress_state['pages']}`", inline=True)
-        final_embed.add_field(name="\u200B", value="\u200B", inline=True) # حقل فارغ لتنسيق المظهر
+        final_embed.add_field(name="\u200B", value="\u200B", inline=True)
         
-        # شرح التمديد داخل الرسالة
         final_embed.add_field(
             name="💡 معلومة مفيدة:", 
             value="يتيح لك زر **(تمديد الوقت)** زيادة وقت بقاء الملف في السيرفر لمدة 10 دقائق إضافية لتأخير الحذف التلقائي.", 
             inline=False
         )
-        
         final_embed.set_footer(text="⚠️ سيتم حذف الملف تلقائياً بعد 15 دقيقة في حال عدم تمديد الوقت.")
         
-        view = FileManagementView(file_path, direct_link, display_name)
+        view = FileManagementView(file_path, direct_link, filename)
         await current_message.edit(embed=final_embed, view=view)
         
         asyncio.create_task(background_cleanup_task(file_path))
