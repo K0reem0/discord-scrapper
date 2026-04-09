@@ -7,6 +7,7 @@ import time
 import base64
 import re
 import shutil
+import gc  # 🔥 [جديد] مكتبة لتنظيف الرام إجبارياً
 from typing import Literal
 from io import BytesIO
 from PIL import Image
@@ -69,6 +70,11 @@ def init_driver():
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
+    # 🔥 [جديد] أوامر تقييد استهلاك الذاكرة في Chrome
+    chrome_options.add_argument("--disable-site-isolation-trials") 
+    chrome_options.add_argument("--disable-application-cache")
+    chrome_options.add_argument("--js-flags=--expose-gc")
+    
     chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN")
 
     try:
@@ -129,10 +135,8 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                     
                     if src and src.startswith(check_url_string) and src not in processed_urls:
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
-                        # استخدام وقت الانتظار المخصص حسب اختيار المستخدم للسرعة
                         time.sleep(img_sleep) 
                         
-                        # تمرير متغير الجودة المخصص (img_quality) للجافاسكريبت
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
                             var quality = arguments[1];
@@ -144,7 +148,15 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                             canvasElement.height = img.naturalHeight;
                             
                             con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
-                            return canvasElement.toDataURL('image/jpeg', quality);
+                            var data = canvasElement.toDataURL('image/jpeg', quality);
+                            
+                            // 🔥 [جديد] تدمير الكانفاس فوراً لتفريغ الرام في المتصفح
+                            con.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                            canvasElement.width = 0;
+                            canvasElement.height = 0;
+                            canvasElement = null;
+                            
+                            return data;
                         """, img, img_quality)
                         
                         if b64_data:
@@ -162,7 +174,9 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
                             extracted_in_this_pass = True
                             empty_scrolls = 0
                             
+                            # 🔥 [جديد] الإجبار على مسح المتغيرات الضخمة من الرام
                             del b64_data, b64_string, img_bytes
+                            gc.collect() # استدعاء منظف الذاكرة
                             break 
                             
                 except StaleElementReferenceException:
@@ -170,9 +184,10 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_q
             
             if not extracted_in_this_pass:
                 driver.execute_script("window.scrollBy(0, window.innerHeight);")
-                # استخدام وقت التمرير المخصص حسب اختيار المستخدم
                 time.sleep(scroll_sleep)
                 empty_scrolls += 1
+                # مسح ذاكرة المتصفح العشوائية أثناء التمرير
+                driver.execute_script("window.gc && window.gc();") 
             
             if empty_scrolls >= 6:
                 break
@@ -256,15 +271,13 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # --- ترجمة خيارات الجودة ---
     if "عالية" in quality:
         img_quality = 0.9
     elif "منخفضة" in quality:
         img_quality = 0.5
     else:
-        img_quality = 0.7 # متوسطة
+        img_quality = 0.7
         
-    # --- ترجمة خيارات السرعة ---
     if "بطيئة" in speed:
         img_sleep = 1.2
         scroll_sleep = 1.5
@@ -272,7 +285,7 @@ async def fetch_pdf(
         img_sleep = 0.3
         scroll_sleep = 0.8
     else:
-        img_sleep = 0.8 # متوسطة
+        img_sleep = 0.8
         scroll_sleep = 1.2
 
     progress_state = {
@@ -284,17 +297,15 @@ async def fetch_pdf(
         "error": None
     }
     
-    # مسار خلفي لتشغيل السيلينيوم
     task = asyncio.create_task(
         asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_quality, img_sleep, scroll_sleep)
     )
     
-    # 🌟 خدعة الـ 15 دقيقة: جلب كائن الرسالة الأصلية للتحكم بها عبر Bot API بدلاً من Webhook
     original_response = await interaction.original_response()
     try:
         current_message = await interaction.channel.fetch_message(original_response.id)
     except Exception:
-        current_message = original_response # كخطة بديلة
+        current_message = original_response
         
     message_creation_time = time.time()
     
@@ -307,7 +318,6 @@ async def fetch_pdf(
         p_bar = create_progress_bar(current_pages, expected_pages)
         pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
         
-        # حساب الوقت المقدر
         eta_text = "جاري الحساب..."
         if start_time and current_pages > 0:
             elapsed_time = time.time() - start_time
@@ -322,11 +332,10 @@ async def fetch_pdf(
                 else:
                     eta_text = f"حوالي {secs} ثانية"
             else:
-                eta_text = "غير معروف (لم يتم إدخال إجمالي الصفحات)"
+                eta_text = "غير معروف (لم يتم إدخال الإجمالي)"
         elif not expected_pages:
-            eta_text = "غير معروف (لم يتم إدخال إجمالي الصفحات)"
+            eta_text = "غير معروف (لم يتم إدخال الإجمالي)"
         
-        # تصميم رسالة التحديث
         embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
         embed.add_field(name="الاسم الأصلي:", value=f"`{title}`", inline=False)
         embed.add_field(name="الحالة:", value=f"**{status_msg}**", inline=False)
@@ -335,20 +344,15 @@ async def fetch_pdf(
         embed.add_field(name="الوقت المقدر (ETA):", value=f"`{eta_text}`", inline=True)
         embed.set_footer(text=f"⚙️ الجودة: {quality.split(' ')[0]} | السرعة: {speed.split(' ')[0]}")
         
-        # 🌟 التحقق من انتهاء صلاحية رسالة الديسكورد (تتجدد كل 14 دقيقة)
         time_elapsed_since_creation = time.time() - message_creation_time
-        if time_elapsed_since_creation >= 840: # 840 ثانية = 14 دقيقة
+        if time_elapsed_since_creation >= 840: 
             try:
-                # إرسال رسالة جديدة في نفس القناة
                 new_message = await interaction.channel.send(embed=embed)
-                # حذف الرسالة القديمة المنتهية
                 await current_message.delete()
-                # تعيين الرسالة الجديدة كالرسالة الحالية
                 current_message = new_message
                 message_creation_time = time.time()
-                print("[INFO] Message renewed to bypass 15-minute Discord limit.")
-            except Exception as e:
-                print(f"[ERROR] Failed to renew message: {e}")
+            except Exception:
+                pass
         else:
             try:
                 await current_message.edit(embed=embed)
@@ -357,7 +361,6 @@ async def fetch_pdf(
         
         await asyncio.sleep(5) 
     
-    # بعد انتهاء المهمة بالنجاح أو الفشل:
     result = await task
     
     if result.get("success"):
