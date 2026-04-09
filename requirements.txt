@@ -6,3 +6,8 @@ dropbox
 selenium
 webdriver-manager
 reportlab
+asyncpg
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
