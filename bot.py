@@ -4,7 +4,7 @@ import asyncio
 import os
 import time
 import base64
-import aiohttp
+import re
 from io import BytesIO
 from PIL import Image
 
@@ -22,38 +22,31 @@ from selenium.common.exceptions import WebDriverException, StaleElementReference
 
 # --- الإعدادات ---
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-# رابط تطبيق هيروكو الخاص بك (بدون شرطة / في النهاية)
 HEROKU_BASE_URL = "https://discord-scrap-f0a38eba4b1c.herokuapp.com" 
 
-# إنشاء مجلد التنزيلات إذا لم يكن موجوداً
 DOWNLOADS_DIR = "downloads"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# إعداد البوت
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- إعدادات خادم الويب (لتقديم الملفات) ---
+# --- إعدادات خادم الويب ---
 async def download_file_handler(request):
-    """معالج طلبات تحميل الملفات"""
     filename = request.match_info.get('filename')
     file_path = os.path.join(DOWNLOADS_DIR, filename)
     
     if not os.path.exists(file_path):
         return web.Response(status=404, text="❌ الملف غير موجود أو تم حذفه لانتهاء صلاحيته.")
     
-    # فرض التحميل المباشر كملف
     return web.FileResponse(file_path, headers={
         'Content-Disposition': f'attachment; filename="{filename}"'
     })
 
 async def health_check_handler(request):
-    """صفحة رئيسية بسيطة للتأكد من عمل السيرفر"""
-    return web.Response(text="✅ بوت الديسكورد وخادم الملفات يعملان بنجاح!")
+    return web.Response(text="✅ خادم الملفات يعمل بنجاح!")
 
 async def start_web_server():
-    """تشغيل خادم الويب في الخلفية مع البوت"""
     app = web.Application()
     app.router.add_get('/', health_check_handler)
     app.router.add_get(f'/{DOWNLOADS_DIR}/{{filename}}', download_file_handler)
@@ -68,51 +61,60 @@ async def start_web_server():
 
 # --- إعدادات Selenium ---
 def init_driver():
-    """تهيئة متصفح Chrome في وضع Headless (Heroku - chrome-for-testing)"""
     chrome_options = Options()
-
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
-
     chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN")
 
     try:
         driver = webdriver.Chrome(options=chrome_options)
         driver.set_page_load_timeout(60)
-        print("[INFO] Chrome Driver initialized successfully (chrome-for-testing).")
         return driver
-
     except WebDriverException as e:
-        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {type(e).__name__} - {e}")
+        print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_filename: str):
-    """سكربت Selenium لاستخراج الصور وتجميعها في PDF"""
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict):
+    """سكربت استخراج الصور مع تحديث الحالة المشتركة لـ Progress Bar"""
     driver = init_driver()
     if not driver:
-        return {"success": False, "error": "فشل في تشغيل المتصفح. تأكد من إعدادات Heroku."}
+        progress_state["error"] = "فشل في تشغيل المتصفح."
+        return {"success": False, "error": progress_state["error"]}
 
     images_base64 = []
     processed_urls = set()
     
     try:
+        progress_state["status"] = "جاري فتح الصفحة وجلب المعلومات..."
         driver.get(url)
         
         WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.TAG_NAME, 'img'))
         )
         
-        scroll_attempts = 0
-        max_attempts = 1500  # زيادة الحد لدعم الملفات التي تصل لـ 1000+ صفحة
-        empty_scrolls = 0    # عداد لمعرفة متى نصل لنهاية الملف
+        # استخراج اسم الملف من عنوان الصفحة
+        time.sleep(2) # انتظار خفيف لتحميل العنوان
+        raw_title = driver.title.replace(" - Google Drive", "").strip()
         
-        print(f"[INFO] Starting to extract document: {output_filename}")
+        # تنظيف الاسم من الرموز الممنوعة في أسماء الملفات
+        clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title)
+        if not clean_title:
+            clean_title = f"drive_doc_{output_id}"
+            
+        if not clean_title.lower().endswith(".pdf"):
+            clean_title += ".pdf"
+            
+        progress_state["title"] = clean_title
+        progress_state["status"] = "جاري سحب الصفحات..."
+        
+        scroll_attempts = 0
+        max_attempts = 1500
+        empty_scrolls = 0
         
         while scroll_attempts < max_attempts:
-            # 1. إحضار العناصر الموجودة في الصفحة *حالياً*
             img_elements = driver.find_elements(By.TAG_NAME, 'img')
             extracted_in_this_pass = False
             
@@ -122,9 +124,8 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
                     check_url_string = "blob:https://drive.google.com/"
                     
                     if src and src.startswith(check_url_string) and src not in processed_urls:
-                        # النزول للصورة لضمان تحميلها بأعلى جودة
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
-                        time.sleep(1) # انتظار ثانية لتكتمل الدقة
+                        time.sleep(1) 
                         
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
@@ -142,31 +143,32 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
                         if b64_data:
                             images_base64.append(b64_data)
                             processed_urls.add(src)
+                            
+                            # تحديث عداد الصفحات للشريط
+                            progress_state["pages"] = len(images_base64)
+                            
                             extracted_in_this_pass = True
                             empty_scrolls = 0
-                            
-                            # ⚠️ كسر الحلقة هنا مهم جداً: لتحديث عناصر الصفحة وتفادي خطأ Stale Element
                             break 
                             
                 except StaleElementReferenceException:
-                    # إذا اختفت الصورة أثناء المحاولة، نكسر الحلقة لنجلب العناصر الجديدة من الـ DOM
                     break
             
-            # إذا لم نجد صوراً جديدة في هذه المحاولة، نقوم بعمل سكرول إجباري للأسفل
             if not extracted_in_this_pass:
                 driver.execute_script("window.scrollBy(0, window.innerHeight);")
                 time.sleep(1.5)
                 empty_scrolls += 1
             
-            # إذا قمنا بالسكرول 6 مرات متتالية ولم نجد صوراً جديدة، فهذا يعني أننا وصلنا للنهاية
             if empty_scrolls >= 6:
-                print(f"[INFO] Reached the end of the document. Total pages: {len(images_base64)}")
                 break
                 
             scroll_attempts += 1
 
         if not images_base64:
-            return {"success": False, "error": "لم يتم العثور على أي محتوى مطابق."}
+            progress_state["error"] = "لم يتم العثور على أي محتوى مطابق."
+            return {"success": False, "error": progress_state["error"]}
+        
+        progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF (قد يستغرق لحظات)..."
         
         pil_images = []
         for index, b64 in enumerate(images_base64):
@@ -174,13 +176,14 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
                 b64_string = b64.split(",")[1]
             else:
                 continue
-                
             img_bytes = base64.b64decode(b64_string)
             img_obj = Image.open(BytesIO(img_bytes)).convert('RGB')
             pil_images.append(img_obj)
 
-        # حفظ الملف في مجلد التنزيلات
-        pdf_path = os.path.join(os.getcwd(), DOWNLOADS_DIR, output_filename)
+        # إضافة المعرف للاسم لمنع التعارض إذا تم تحميل ملفين بنفس الاسم بوقت واحد
+        safe_filename = f"{output_id}_{clean_title}"
+        pdf_path = os.path.join(os.getcwd(), DOWNLOADS_DIR, safe_filename)
+        
         pil_images[0].save(
             pdf_path, 
             save_all=True, 
@@ -188,68 +191,115 @@ def extract_pdf_via_canvas(url: str, output_filename: str):
             resolution=100.0
         )
         
-        return {"success": True, "file_path": pdf_path, "filename": output_filename}
+        return {"success": True, "file_path": pdf_path, "filename": safe_filename, "display_name": clean_title}
 
     except Exception as e:
+        progress_state["error"] = str(e)
         return {"success": False, "error": str(e)}
     finally:
+        progress_state["done"] = True
         if driver:
             driver.quit()
 
-# --- دالة الحذف التلقائي بعد 15 دقيقة ---
 async def delete_file_after_delay(file_path: str, delay_seconds: int = 900):
-    """تنتظر مدة معينة ثم تحذف الملف"""
     await asyncio.sleep(delay_seconds)
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
-            print(f"[INFO] 🗑️ تم حذف الملف تلقائياً: {file_path}")
         except Exception as e:
-            print(f"[ERROR] فشل حذف الملف {file_path}: {e}")
+            print(f"[ERROR] فشل الحذف: {e}")
 
-# --- أحداث البوت ---
 @bot.event
 async def on_ready():
     print(f'Bot is ready. Logged in as {bot.user}')
-    
     bot.loop.create_task(start_web_server())
-
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash commands.")
+        await bot.tree.sync()
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+        print(f"Sync error: {e}")
+
+def create_progress_bar(current, total, length=15):
+    """دالة لإنشاء شكل شريط التقدم"""
+    if total is None or total <= 0:
+        return "[▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] (غير محدد)"
+    
+    percent = min(int((current / total) * 100), 100)
+    filled_length = int(length * current // total)
+    bar = '█' * filled_length + '░' * (length - filled_length)
+    return f"[{bar}] {percent}%"
 
 @bot.tree.command(name="fetchpdf", description="استخراج ملف من جوجل درايف وإعطاء رابط تحميل مباشر")
-@discord.app_commands.describe(url="رابط جوجل درايف للملف")
-async def fetch_pdf(interaction: discord.Interaction, url: str):
+@discord.app_commands.describe(
+    url="رابط جوجل درايف للملف",
+    expected_pages="عدد الصفحات (اختياري) للحصول على شريط تقدم دقيق"
+)
+async def fetch_pdf(interaction: discord.Interaction, url: str, expected_pages: int = None):
     
     await interaction.response.defer(ephemeral=False)
-    await interaction.edit_original_response(content="⏳ **جاري معالجة الملف...** *(قد يستغرق الملف المكون من 400 صفحة عدة دقائق، يرجى الانتظار)*")
     
-    output_filename = f"drive_doc_{interaction.id}.pdf"
+    # قاموس لتتبع حالة العملية ومشاركتها بين مسار الديسكورد ومسار السيلينيوم
+    progress_state = {
+        "status": "تهيئة المتصفح...",
+        "pages": 0,
+        "title": "جاري التعرف على الملف...",
+        "done": False,
+        "error": None
+    }
     
-    result = await asyncio.to_thread(extract_pdf_via_canvas, url, output_filename)
+    # تشغيل عملية السحب في مسار خلفي
+    task = asyncio.create_task(
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state)
+    )
     
-    if result["success"]:
+    # حلقة التحديث الحي لرسالة الديسكورد (كل 5 ثواني)
+    while not task.done():
+        status_msg = progress_state["status"]
+        current_pages = progress_state["pages"]
+        title = progress_state["title"]
+        
+        p_bar = create_progress_bar(current_pages, expected_pages)
+        pages_text = f"{current_pages} / {expected_pages}" if expected_pages else f"{current_pages} (لم يتم إدخال الإجمالي)"
+        
+        embed = discord.Embed(title="📥 جاري استخراج الملف", color=discord.Color.blue())
+        embed.add_field(name="الاسم الأصلي:", value=f"`{title}`", inline=False)
+        embed.add_field(name="الحالة:", value=f"**{status_msg}**", inline=False)
+        embed.add_field(name="التقدم:", value=f"`{p_bar}`", inline=False)
+        embed.add_field(name="الصفحات المسحوبة:", value=f"`{pages_text}`", inline=False)
+        
+        try:
+            await interaction.edit_original_response(content=None, embed=embed)
+        except Exception:
+            pass # تجاهل الأخطاء إذا حصل تأخير في الشبكة
+        
+        await asyncio.sleep(5) # التحديث كل 5 ثواني
+    
+    # عند انتهاء المهمة:
+    result = await task
+    
+    if result.get("success"):
         file_path = result["file_path"]
         filename = result["filename"]
+        display_name = result["display_name"]
         
         direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{filename}"
         
-        await interaction.edit_original_response(content=(
-            f"✅ **تم تجهيز الملف بنجاح!**\n\n"
-            f"📥 **رابط التحميل المباشر:**\n{direct_link}\n\n"
-            f"⚠️ *ملاحظة: هذا الرابط سيعمل لمدة **15 دقيقة** فقط وسيتم حذف الملف تلقائياً لتوفير المساحة.*"
-        ))
+        final_embed = discord.Embed(
+            title="✅ تم تجهيز الملف بنجاح!", 
+            description=f"تم استخراج جميع الصفحات لملف **{display_name}**.",
+            color=discord.Color.green()
+        )
+        final_embed.add_field(name="📥 رابط التحميل المباشر:", value=f"[اضغط هنا لتحميل الملف]({direct_link})\nأو انسخ الرابط:\n`{direct_link}`", inline=False)
+        final_embed.set_footer(text="⚠️ سيتم حذف هذا الرابط والملف تلقائياً بعد 15 دقيقة.")
+        
+        await interaction.edit_original_response(embed=final_embed)
         
         asyncio.create_task(delete_file_after_delay(file_path, 900))
         
     else:
-        await interaction.edit_original_response(content=f"❌ **فشل استخراج الملف:** {result['error']}")
+        err_embed = discord.Embed(title="❌ فشل العملية", description=result.get('error'), color=discord.Color.red())
+        await interaction.edit_original_response(embed=err_embed)
 
 if DISCORD_BOT_TOKEN:
     bot.run(DISCORD_BOT_TOKEN)
 else:
-    print("[CRITICAL ERROR] DISCORD_BOT_TOKEN not found in environment variables.")
-
+    print("[CRITICAL ERROR] Token not found.")
