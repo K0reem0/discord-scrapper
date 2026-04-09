@@ -13,6 +13,9 @@ from typing import Literal
 from io import BytesIO
 from PIL import Image, JpegImagePlugin
 
+# المكتبة السحرية الجديدة لتجميع الـ PDF بدون رام
+from reportlab.pdfgen import canvas
+
 # استيرادات خادم الويب
 from aiohttp import web
 
@@ -38,13 +41,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- إعدادات خادم الويب (محدثة لتدعم المجلدات) ---
+# --- إعدادات خادم الويب ---
 async def download_file_handler(request):
     folder_id = request.match_info.get('folder_id')
     filename = request.match_info.get('filename')
     
     decoded_filename = urllib.parse.unquote(filename)
-    # الوصول للملف داخل مجلد الـ ID
     file_path = os.path.join(DOWNLOADS_DIR, folder_id, decoded_filename)
     
     if not os.path.exists(file_path):
@@ -60,7 +62,6 @@ async def health_check_handler(request):
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', health_check_handler)
-    # تحديث مسار الرابط ليتضمن مجلد الـ ID
     app.router.add_get(f'/{DOWNLOADS_DIR}/{{folder_id}}/{{filename}}', download_file_handler)
     
     runner = web.AppRunner(app)
@@ -71,17 +72,16 @@ async def start_web_server():
     await site.start()
     print(f"[INFO] Web server started on port {port}")
 
-# --- دالة الحذف الذكية (تحذف الملف ومجلده) ---
+# --- دالة الحذف الذكية ---
 async def background_cleanup_task(file_path):
     while file_path in expiration_times:
         current_time = time.time()
         if current_time >= expiration_times[file_path]:
             if os.path.exists(file_path):
                 try:
-                    os.remove(file_path) # حذف الملف
+                    os.remove(file_path)
                     print(f"[INFO] 🗑️ تم حذف الملف تلقائياً: {file_path}")
                     
-                    # حذف المجلد إذا أصبح فارغاً
                     folder_path = os.path.dirname(file_path)
                     if os.path.exists(folder_path) and not os.listdir(folder_path):
                         os.rmdir(folder_path)
@@ -99,9 +99,9 @@ class FileManagementView(ui.View):
         self.download_url = download_url
         self.display_name = display_name
         
-        self.add_item(ui.Button(label="تحميل", url=self.download_url, style=discord.ButtonStyle.link, emoji="📥", row=0))
+        self.add_item(ui.Button(label="تحميل الملف", url=self.download_url, style=discord.ButtonStyle.link, emoji="📥", row=0))
 
-    @ui.button(label="تمديد", style=discord.ButtonStyle.primary, emoji="⏳", row=0)
+    @ui.button(label="تمديد الوقت (+10د)", style=discord.ButtonStyle.primary, emoji="⏳", row=0)
     async def extend_timer(self, interaction: discord.Interaction, button: ui.Button):
         if self.file_path in expiration_times:
             expiration_times[self.file_path] += 600
@@ -114,7 +114,7 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ عذراً، يبدو أن الملف قد تم حذفه بالفعل.", ephemeral=True)
 
-    @ui.button(label="حذف", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
+    @ui.button(label="حذف الآن", style=discord.ButtonStyle.danger, emoji="🗑️", row=0)
     async def delete_now(self, interaction: discord.Interaction, button: ui.Button):
         if os.path.exists(self.file_path):
             try: 
@@ -135,16 +135,16 @@ class FileManagementView(ui.View):
         else:
             await interaction.response.send_message("❌ الملف غير موجود بالفعل.", ephemeral=True)
 
-# --- إعدادات Selenium (محدثة لتقبل كثافة البكسلات) ---
-def init_driver(scale_factor: float):
+# --- إعدادات Selenium (تغيير ذكي للأبعاد حسب الجودة) ---
+def init_driver(scale_factor: float, window_size: str):
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=2560,1440")
     
-    # 🔥 تغيير كثافة البكسلات بناءً على اختيار المستخدم
+    # تحديد أبعاد الشاشة بناءً على الجودة لمنع انهيار الرام
+    chrome_options.add_argument(f"--window-size={window_size}")
     chrome_options.add_argument(f"--force-device-scale-factor={scale_factor}") 
     chrome_options.add_argument("--high-dpi-support=1")
     
@@ -162,8 +162,8 @@ def init_driver(scale_factor: float):
         print(f"[CRITICAL ERROR] Failed to initialize Chrome Driver: {e}")
         return None
 
-def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, scale_factor: float, img_sleep: float, scroll_sleep: float):
-    driver = init_driver(scale_factor)
+def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_format: str, img_quality: float, img_ext: str, scale_factor: float, window_size: str, img_sleep: float, scroll_sleep: float):
+    driver = init_driver(scale_factor, window_size)
     if not driver:
         progress_state["error"] = "فشل في تشغيل المتصفح."
         return {"success": False, "error": progress_state["error"]}
@@ -171,11 +171,9 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
     processed_urls = set()
     saved_images_paths = []
     
-    # إنشاء مجلد رئيسي خاص بالطلب (بالأيدي)
     user_dir = os.path.join(DOWNLOADS_DIR, output_id)
     os.makedirs(user_dir, exist_ok=True)
     
-    # مجلد مؤقت داخل مجلد المستخدم للصور
     temp_dir = os.path.join(user_dir, "temp_images")
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -212,21 +210,37 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
                         driver.execute_script("arguments[0].scrollIntoView(true);", img)
                         time.sleep(img_sleep) 
                         
+                        # كود استخراج محسّن لحماية الرام من الصور الضخمة جداً
                         b64_data = driver.execute_script("""
                             var img = arguments[0];
                             var format = arguments[1];
                             var quality = arguments[2];
                             if (img.naturalWidth === 0) return null;
                             
+                            var w = img.naturalWidth;
+                            var h = img.naturalHeight;
+                            
+                            // تحجيم الصور الفائقة الضخامة لحماية المتصفح من الانهيار
+                            var max_dim = 4000;
+                            if (w > max_dim || h > max_dim) {
+                                var ratio = Math.min(max_dim / w, max_dim / h);
+                                w = Math.round(w * ratio);
+                                h = Math.round(h * ratio);
+                            }
+                            
                             var canvasElement = document.createElement("canvas");
                             var con = canvasElement.getContext("2d");
-                            canvasElement.width = img.naturalWidth;
-                            canvasElement.height = img.naturalHeight;
+                            canvasElement.width = w;
+                            canvasElement.height = h;
                             
-                            con.drawImage(img, 0, 0, img.naturalWidth, img.naturalHeight);
+                            // إضافة خلفية بيضاء لتفادي مشاكل الشفافية
+                            con.fillStyle = "#FFFFFF";
+                            con.fillRect(0, 0, w, h);
+                            con.drawImage(img, 0, 0, w, h);
+                            
                             var data = canvasElement.toDataURL(format, quality);
                             
-                            con.clearRect(0, 0, canvasElement.width, canvasElement.height);
+                            con.clearRect(0, 0, w, h);
                             canvasElement.width = 0;
                             canvasElement.height = 0;
                             canvasElement = null;
@@ -273,19 +287,29 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
             return {"success": False, "error": progress_state["error"]}
         
         progress_state["extracting"] = False 
-        progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF..."
+        progress_state["status"] = "جاري تجميع الملف وتحويله لـ PDF (بدون استهلاك للذاكرة)..."
         
-        # حفظ الـ PDF داخل مجلد المستخدم بالاسم الأصلي النقي فقط
+        # حفظ الـ PDF داخل مجلد المستخدم
         pdf_path = os.path.join(user_dir, clean_title)
         
-        first_image = Image.open(saved_images_paths[0]).convert('RGB')
-        
-        def image_generator():
-            for img_path in saved_images_paths[1:]:
+        # 🔥 هنا السر الجديد: استخدام ReportLab لتجميع الـ PDF لضمان عدم استهلاك الرام أبداً
+        c = canvas.Canvas(pdf_path)
+        for img_path in saved_images_paths:
+            try:
                 with Image.open(img_path) as img:
-                    yield img.convert('RGB')
-
-        first_image.save(pdf_path, save_all=True, append_images=image_generator(), resolution=100.0)
+                    w, h = img.size
+                
+                # إعداد مقاس الصفحة ليكون مطابقاً للصورة تماماً
+                c.setPageSize((w, h))
+                # رسم الصورة في الإحداثيات 0,0 
+                c.drawImage(img_path, 0, 0, width=w, height=h)
+                # إنهاء الصفحة وإرسالها للقرص الصلب مباشرة (تفريغ الرام)
+                c.showPage()
+                gc.collect()
+            except Exception as e:
+                print(f"[WARNING] Skipping corrupted image {img_path}: {e}")
+                
+        c.save() # حفظ الملف النهائي
         
         return {"success": True, "file_path": pdf_path, "filename": clean_title, "folder_id": output_id}
 
@@ -294,7 +318,6 @@ def extract_pdf_via_canvas(url: str, output_id: str, progress_state: dict, img_f
     finally:
         progress_state["done"] = True
         if driver: driver.quit()
-        # حذف مجلد الصور المؤقتة فقط وترك الـ PDF
         if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
 
 @bot.event
@@ -331,13 +354,13 @@ async def fetch_pdf(
 ):
     await interaction.response.defer(ephemeral=False)
     
-    # تحديد الجودة وكثافة البكسلات (Scale Factor)
+    # تحديد الجودة وكثافة البكسلات وحجم الشاشة لمنع انهيار هيروكو
     if "عالية" in quality:
-        img_format, img_quality, img_ext, scale_factor = "image/png", 1.0, "png", 3.0
+        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 1.0, "jpg", 2.0, "1200,1600"
     elif "منخفضة" in quality:
-        img_format, img_quality, img_ext, scale_factor = "image/jpeg", 0.5, "jpg", 1.0
+        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 0.5, "jpg", 1.0, "800,1200"
     else:
-        img_format, img_quality, img_ext, scale_factor = "image/jpeg", 0.8, "jpg", 1.5
+        img_format, img_quality, img_ext, scale_factor, window_size = "image/jpeg", 0.8, "jpg", 1.5, "1000,1400"
         
     if "بطيئة" in speed:
         img_sleep, scroll_sleep = 1.2, 1.5
@@ -357,7 +380,7 @@ async def fetch_pdf(
     }
     
     task = asyncio.create_task(
-        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, scale_factor, img_sleep, scroll_sleep)
+        asyncio.to_thread(extract_pdf_via_canvas, url, str(interaction.id), progress_state, img_format, img_quality, img_ext, scale_factor, window_size, img_sleep, scroll_sleep)
     )
     
     original_response = await interaction.original_response()
@@ -434,7 +457,6 @@ async def fetch_pdf(
         file_size_mb = file_size_bytes / (1024 * 1024)
         
         encoded_filename = urllib.parse.quote(filename)
-        # الرابط الآن يتضمن مجلد الـ ID
         direct_link = f"{HEROKU_BASE_URL}/{DOWNLOADS_DIR}/{folder_id}/{encoded_filename}"
         
         expiration_times[file_path] = time.time() + 900 
